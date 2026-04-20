@@ -45,9 +45,12 @@ ALARMv3/
 │   ├── alarmv2_analysis.md     # Deep dive into ALARMv2
 │   └── comparative_analysis.md # Comparison and synthesis
 └── planning/                    # Planning and design documents
-    ├── vision_and_requirements.md    # Vision, personas, features
-    ├── technical_architecture.md     # System architecture
-    └── mvp_scope.md                  # MVP definition and plan
+    ├── vision_and_requirements.md         # Vision, personas, features
+    ├── technical_architecture.md          # System architecture
+    ├── mvp_scope.md                       # MVP definition and plan
+    ├── mcp_first_architecture.md          # MCP-first target structure
+    ├── mcp_server_spec.md                 # MCP tools/resources/prompts
+    └── artifact_and_orchestration_spec.md # Artifacts, coverage, orchestration
 ```
 
 ## Research Documents
@@ -100,6 +103,27 @@ Implementation plan for the first release:
 - Dependencies and success metrics
 - Post-MVP roadmap
 
+### [MCP-First Architecture](planning/mcp_first_architecture.md)
+Target operating model for the next implementation phase:
+- ALARM core vs MCP wrapper vs sync adapter boundaries
+- read-only attached-repo flow and optional working-repo flow
+- Codespaces-friendly local-first artifact model
+- phased MCP-first delivery path
+
+### [MCP Server Spec](planning/mcp_server_spec.md)
+Canonical MCP contract for ALARMv3:
+- tool surface
+- resource inventory
+- prompt inventory
+- guardrail state transitions
+
+### [Artifact & Orchestration Spec](planning/artifact_and_orchestration_spec.md)
+Canonical local artifact and swarm-analysis contract:
+- deterministic session layout
+- provenance and coverage proof
+- orchestration model and worker roles
+- future SharePoint sync boundary
+
 ## Key Insights
 
 ### What Makes v3 Different
@@ -135,7 +159,7 @@ ALARMv3 aims to combine:
    - Refine scope based on input
 
 4. ⏳ **Implementation Phase** (Upcoming)
-   - Build MVP core
+   - Build MCP-first MVP core
    - Iterate based on testing
    - Release v0.1.0
 
@@ -159,4 +183,4 @@ For questions or feedback, please open an issue in this repository.
 
 ---
 
-**Note**: No code implementation exists yet. This repository contains only research and planning documents. Implementation will begin after the planning phase is validated and refined based on feedback.
+**Note**: No code implementation exists yet. This repository contains research and planning documents, including the new MCP-first architecture and artifact specifications that define the next implementation phase.

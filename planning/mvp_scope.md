@@ -2,9 +2,9 @@
 
 ## MVP Definition
 
-**Goal**: Deliver a working tool that provides immediate value to users analyzing legacy codebases for modernization.
+**Goal**: Deliver a working MCP-first tool that provides immediate value to users analyzing legacy codebases for modernization while preserving the attached repository as a read-only reference baseline.
 
-**Timeline**: 4-6 weeks (assuming part-time development)
+**Timeline**: 4-6 weeks for an initial MCP-first foundation (assuming part-time development)
 
 **Success Criteria**:
 - Analyzes a codebase in < 2 minutes for 50k LOC
@@ -17,9 +17,16 @@
 
 ### ✅ In Scope (MUST HAVE)
 
+#### 0. MCP-First Session and Guardrails
+- Explicit repository attachment
+- Mandatory guardrail confirmation before deep analysis
+- Read-only analysis mode locked by default
+- Session provenance and audit trail
+
 #### 1. Basic Analysis Engine
 - **File Scanner**
   - Recursive directory traversal
+  - Immutable traversal manifest
   - Pattern-based filtering (exclude node_modules, etc.)
   - File size limits
   - Language detection by extension
@@ -34,6 +41,7 @@
   - Common anti-patterns (hardcoded credentials, etc.)
   - Framework detection (Django, React, Spring, etc.)
   - Configuration file identification
+  - Coverage proof for mapped vs analyzed files
 
 #### 2. Risk Assessment
 - **Complexity Scoring**
@@ -73,18 +81,27 @@
   - Machine-readable format
   - For tool integration
 
-#### 5. CLI Interface
+#### 5. MCP Server Surface
+- `attach_repository(path)`
+- `confirm_guardrails(policy_profile)`
+- `start_full_mapping(session_id, mode=read_only)`
+- `run_dependency_analysis(session_id, depth=all)`
+- `generate_architecture_knowledge(session_id)`
+- `generate_modernization_recommendations(session_id, prioritization_profile)`
+
+#### 6. CLI Interface
 - `alarmv3 analyze <path>` - Run analysis
 - `alarmv3 init-config` - Generate config template
 - `alarmv3 version` - Show version info
 - `alarmv3 help` - Show usage help
 
-#### 6. Configuration
+#### 7. Configuration
 - **YAML-based config file**
   - Exclude/include patterns
   - Language preferences
   - Output settings
   - Risk thresholds
+  - Worker pool and checkpoint settings
 
 - **Sensible defaults**
   - Works without config file
@@ -98,6 +115,7 @@
 - Dependency graph visualization
 - HTML/PDF reports
 - Interactive web UI
+- Progress/event streaming for long MCP sessions
 - Migration roadmap generation
 - Effort estimation
 - Task sequencing
@@ -110,11 +128,18 @@
 - Team collaboration features
 - CI/CD integration
 - Progress tracking
-- Code transformations
+- Code transformations in isolated working repos
+
+#### Phase 4 Features
+- Working repository/worktree creation
+- Agent-swarm implementation briefs
+- Migration journal generation
+- SharePoint sync adapter
 
 ### ❌ Out of Scope (NOT PLANNED)
 
 - Actual code transformation/refactoring
+- Direct modification of the attached legacy repo during analysis mode
 - IDE integration
 - Real-time code analysis
 - Cloud-hosted service
@@ -236,21 +261,32 @@ ALARMv3/
 │   └── alarmv3/
 │       ├── __init__.py
 │       ├── __main__.py
-│       ├── cli.py              # Click-based CLI
-│       ├── config.py           # Configuration handling
-│       ├── scanner.py          # File discovery
-│       ├── analyzer.py         # Core analysis logic
-│       ├── metrics.py          # Metrics calculation
-│       ├── patterns.py         # Pattern detection
-│       ├── risk.py             # Risk assessment
-│       ├── recommendations.py  # Recommendation engine
-│       ├── reports.py          # Report generation
-│       └── utils.py            # Utilities
+│       ├── cli.py                    # Secondary CLI surface
+│       ├── config.py                 # Configuration handling
+│       ├── mcp/
+│       │   ├── server.py             # MCP server entrypoint
+│       │   ├── tools.py              # MCP tool handlers
+│       │   ├── resources.py          # MCP resource registry
+│       │   └── prompts.py            # MCP prompt templates
+│       ├── core/
+│       │   ├── session.py            # Session metadata and checkpoints
+│       │   ├── guardrails.py         # Policy and consent state
+│       │   ├── discovery.py          # Recursive manifest generation
+│       │   ├── analysis.py           # Core analysis logic
+│       │   ├── synthesis.py          # Knowledge and recommendations
+│       │   ├── artifacts.py          # JSON/Markdown output
+│       │   ├── index.py              # SQLite artifact index
+│       │   └── orchestration.py      # Worker coordination and telemetry
+│       └── adapters/
+│           └── sync/
+│               ├── localfs.py        # Local artifact persistence
+│               └── sharepoint.py     # Deferred sync adapter
 ├── tests/
 │   ├── __init__.py
-│   ├── test_scanner.py
-│   ├── test_analyzer.py
-│   ├── test_recommendations.py
+│   ├── test_discovery.py
+│   ├── test_analysis.py
+│   ├── test_guardrails.py
+│   ├── test_mcp_server.py
 │   └── fixtures/
 │       └── sample_projects/
 ├── docs/
@@ -263,44 +299,45 @@ ALARMv3/
 
 ## Core Modules (MVP)
 
-### 1. `scanner.py`
+### 1. `core/discovery.py`
 ```python
-class FileScanner:
-    def scan(self, path: Path, config: Config) -> List[FileInfo]
+class DiscoveryEngine:
+    def attach_repository(self, path: Path) -> ProjectSession
+    def build_manifest(self, session: ProjectSession) -> TraversalManifest
     def detect_language(self, file: Path) -> Optional[str]
-    def should_include(self, file: Path) -> bool
 ```
 
-### 2. `analyzer.py`
+### 2. `core/analysis.py`
 ```python
-class Analyzer:
-    def analyze_project(self, files: List[FileInfo]) -> Analysis
+class AnalysisEngine:
+    def analyze_manifest(self, manifest: TraversalManifest) -> Analysis
     def calculate_metrics(self, files: List[FileInfo]) -> Metrics
-    def detect_frameworks(self, files: List[FileInfo]) -> List[Framework]
+    def build_dependency_graph(self, files: List[FileInfo]) -> Graph
 ```
 
-### 3. `risk.py`
+### 3. `core/guardrails.py`
 ```python
-class RiskAssessor:
-    def assess_file(self, file: FileInfo) -> RiskLevel
-    def assess_project(self, analysis: Analysis) -> ProjectRisk
-    def identify_hotspots(self, analysis: Analysis) -> List[Hotspot]
+class GuardrailManager:
+    def confirm(self, session: ProjectSession, profile: PolicyProfile) -> GuardrailState
+    def enforce_read_only(self, session: ProjectSession) -> None
+    def write_audit_event(self, event: PolicyEvent) -> None
 ```
 
-### 4. `recommendations.py`
+### 4. `core/synthesis.py`
 ```python
-class RecommendationEngine:
+class SynthesisEngine:
+    def generate_architecture_map(self, analysis: Analysis) -> ArchitectureMap
     def generate(self, analysis: Analysis) -> List[Recommendation]
     def prioritize(self, recommendations: List[Recommendation]) -> List[Recommendation]
-    def apply_rules(self, analysis: Analysis) -> List[Recommendation]
 ```
 
-### 5. `reports.py`
+### 5. `mcp/tools.py`
 ```python
-class ReportGenerator:
-    def generate_markdown(self, analysis: Analysis) -> str
-    def generate_json(self, analysis: Analysis) -> str
-    def write_report(self, content: str, path: Path) -> None
+class MCPToolHandlers:
+    def attach_repository(self, path: str) -> ToolResult
+    def confirm_guardrails(self, policy_profile: str) -> ToolResult
+    def start_full_mapping(self, session_id: str, mode: str = "read_only") -> ToolResult
+    def generate_modernization_recommendations(self, session_id: str, prioritization_profile: str) -> ToolResult
 ```
 
 ## Dependencies (Minimal)

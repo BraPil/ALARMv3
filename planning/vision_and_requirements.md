@@ -33,6 +33,11 @@
    - Tracks migration progress
    - Adapts recommendations as code evolves
 
+6. **Safe by Default**
+   - Confirms guardrails before deep analysis
+   - Preserves the attached legacy repository as archive/reference
+   - Stores artifacts locally first
+
 ## Target Users
 
 ### Primary Persona: "Migration Manager Maya"
@@ -95,21 +100,27 @@
 - Progress tracking dashboard
 - Risk heat maps
 
+#### 6. MCP-First Operation
+- Repository attachment to the currently open legacy app
+- MCP tools/resources/prompts as primary interface
+- Guardrail confirmation before analysis
+- Local-first session artifact storage
+
 ### Phase 2: Intelligence
 
-#### 6. Pattern Recognition
+#### 7. Pattern Recognition
 - Detect common anti-patterns
 - Identify refactoring opportunities
 - Suggest design pattern applications
 - Find code duplication
 
-#### 7. Smart Recommendations
+#### 8. Smart Recommendations
 - Context-aware suggestions
 - Technology stack recommendations
 - Framework migration paths
 - Dependency upgrade strategies
 
-#### 8. Learning System
+#### 9. Learning System
 - Learns from user feedback
 - Adapts recommendations over time
 - Project-specific patterns
@@ -117,19 +128,24 @@
 
 ### Phase 3: Collaboration
 
-#### 9. Team Features
+#### 10. Team Features
 - Shared project workspaces
 - Task assignment and tracking
 - Code review integration
 - Progress visualization
 
-#### 10. CI/CD Integration
+#### 11. Working-Repo Modernization
+- Optional separate implementation repo or worktree
+- Agent-swarm execution for selected recommendations
+- Test, validation, and migration journal output
+
+#### 12. CI/CD Integration
 - Automated analysis on commits
 - Migration progress metrics
 - Regression detection
 - Quality gate enforcement
 
-#### 11. Documentation Generator
+#### 13. Documentation Generator
 - Auto-updated architecture docs
 - Migration journal
 - Decision logs
@@ -137,13 +153,13 @@
 
 ### Phase 4: Advanced
 
-#### 12. Automated Refactoring
+#### 14. Automated Refactoring
 - Safe, reversible code transformations
 - Test generation for changes
 - Incremental migration execution
 - Rollback capabilities
 
-#### 13. AI-Powered Insights (Optional)
+#### 15. AI-Powered Insights (Optional)
 - Natural language code queries
 - Semantic code search
 - AI-assisted debugging
