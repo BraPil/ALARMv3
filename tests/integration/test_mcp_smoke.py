@@ -25,6 +25,7 @@ EXPECTED_TOOLS = {
     "get_job_status",
     "run_analysis",
     "generate_recommendations",
+    "query_codebase",
 }
 
 

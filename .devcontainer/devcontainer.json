@@ -1,0 +1,44 @@
+{
+  "name": "ALARMv3",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {}
+  },
+
+  "postCreateCommand": "pip install uv && uv sync --extra dev && curl -fsSL https://ollama.com/install.sh | sh",
+
+  "postStartCommand": "bash .devcontainer/start-ollama.sh",
+
+  "remoteEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    "ALARMV3_WORKSPACE": "${containerWorkspaceFolder}",
+    "OLLAMA_HOST": "127.0.0.1:11434"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "anthropics.claude-code"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "${containerWorkspaceFolder}/.venv/bin/python",
+        "editor.formatOnSave": true,
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff"
+        }
+      }
+    }
+  },
+
+  "forwardPorts": [11434],
+  "portsAttributes": {
+    "11434": {
+      "label": "Ollama API",
+      "onAutoForward": "silent"
+    }
+  }
+}
