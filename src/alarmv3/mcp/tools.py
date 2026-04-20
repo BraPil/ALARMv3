@@ -12,11 +12,33 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from ..core.session import SessionManager
-from ..core.guardrails import SessionState, GuardrailViolation
+from ..core.guardrails import SessionState, GuardrailViolation, ANALYSIS_COMPLETE_STATES
 
 
 def _workspace() -> Path:
     return Path(os.environ.get("ALARMV3_WORKSPACE", Path.cwd()))
+
+
+def _knowledge_built(session) -> bool:
+    """True if at least one embedded chunk exists for this session."""
+    db_path = session.artifact_dir / "analysis.db"
+    if not db_path.exists():
+        return False
+    try:
+        import pysqlite3 as sqlite3
+        import sqlite_vec
+        conn = sqlite3.connect(str(db_path))
+        conn.enable_load_extension(True)
+        conn.load_extension(sqlite_vec.loadable_path())
+        conn.enable_load_extension(False)
+        n = conn.execute(
+            "SELECT COUNT(*) FROM code_chunk WHERE session_id=? AND embedded=1",
+            (session.session_id,),
+        ).fetchone()[0]
+        conn.close()
+        return n > 0
+    except Exception:
+        return False
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -211,4 +233,53 @@ def register_tools(mcp: FastMCP) -> None:
             return {**result, "state": session.state.value}
         except GuardrailViolation as e:
             g.log_error("generate_recommendations", str(e))
+            raise
+
+    @mcp.tool()
+    def query_codebase(session_id: str, question: str, top_k: int = 10) -> dict:
+        """Ask a natural language question about the analyzed codebase.
+
+        Embeds the question with nomic-embed-text (via local Ollama), searches
+        the sqlite-vec index for the most similar code chunks, and returns them
+        with source locations. The knowledge index is built lazily on the first
+        call after analysis completes.
+
+        Requires Ollama running at localhost:11434 with nomic-embed-text pulled.
+        Requires state: ANALYSIS_COMPLETE or later.
+
+        Args:
+            session_id: The session ID.
+            question: Natural language question about the codebase.
+            top_k: Number of results to return (default 10, max 50).
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("query_codebase", {"session_id": session_id, "question": question})
+
+        try:
+            g.require_state_in(session.state, ANALYSIS_COMPLETE_STATES)
+            top_k = min(max(1, top_k), 50)
+
+            from ..core.knowledge import KnowledgeBuilder, OllamaUnavailableError
+            kb = KnowledgeBuilder(session)
+
+            # Lazy build: embed on first query if not already done
+            needs_build = not _knowledge_built(session)
+            if needs_build:
+                kb.build()
+
+            results = kb.query(question, top_k=top_k)
+            return {
+                "session_id": session_id,
+                "question": question,
+                "results": results,
+                "total": len(results),
+                "index_built_this_call": needs_build,
+            }
+        except GuardrailViolation as e:
+            g.log_error("query_codebase", str(e))
             raise

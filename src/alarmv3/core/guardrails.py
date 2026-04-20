@@ -35,6 +35,14 @@ _TRANSITIONS: dict[SessionState, list[SessionState]] = {
 }
 
 
+# States where knowledge querying is permitted
+ANALYSIS_COMPLETE_STATES = [
+    SessionState.ANALYSIS_COMPLETE,
+    SessionState.IMPLEMENTATION_PLANNED,
+    SessionState.WORKING_REPO_READY,
+]
+
+
 class GuardrailViolation(Exception):
     """Raised when a guardrail constraint is violated.
 
