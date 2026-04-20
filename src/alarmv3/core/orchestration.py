@@ -57,10 +57,33 @@ class Orchestrator:
         thread.start()
         return job_id
 
-    def synthesize_recommendations(self) -> dict:
-        """Run LLM synthesis synchronously and return result dict."""
+    def synthesize_recommendations(self, aaa_grounding: "str | None" = None) -> dict:
+        """Run synthesis then adversarial evaluation. Returns combined result dict."""
+        from .evaluation import RecommendationEvaluator
         from .synthesis import Synthesizer
-        return Synthesizer(self._session).run()
+
+        synthesizer = Synthesizer(self._session)
+        synth_result = synthesizer.run(aaa_grounding=aaa_grounding)
+
+        evaluator = RecommendationEvaluator(self._session)
+        evaluations = evaluator.evaluate(
+            synth_result["recommendations"],
+            synthesizer._build_context(),
+        )
+        evaluator.store_evaluations(evaluations)
+
+        verdict_summary = _tally_verdicts(evaluations)
+        return {
+            **synth_result,
+            "evaluator_summary": verdict_summary,
+            "message": (
+                f"Generated {synth_result['recommendation_count']} recommendations. "
+                f"Evaluator: {verdict_summary['accept']} accept, "
+                f"{verdict_summary['revise']} revise, "
+                f"{verdict_summary['reject']} reject. "
+                "Review at recommendations://evaluated then call review_recommendations."
+            ),
+        }
 
     def get_job_status(self, job_id: str) -> dict:
         with self._lock:
@@ -113,3 +136,11 @@ class Orchestrator:
     def _fail_job(self, job_id: str, error: str) -> None:
         with self._lock:
             self._jobs[job_id] = {"status": "failed", "error": error}
+
+
+def _tally_verdicts(evaluations: list[dict]) -> dict:
+    tally: dict[str, int] = {"accept": 0, "revise": 0, "reject": 0, "pending": 0}
+    for ev in evaluations:
+        verdict = ev.get("verdict", "pending")
+        tally[verdict] = tally.get(verdict, 0) + 1
+    return tally

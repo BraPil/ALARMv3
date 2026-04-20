@@ -9,7 +9,6 @@ Python is compiled without enable_load_extension support.
 """
 
 import hashlib
-import time
 from pathlib import Path
 from typing import Optional
 

@@ -25,6 +25,7 @@ src/alarmv3/
 │   ├── analysis.py      tree-sitter parsing, dependency graph, complexity
 │   ├── synthesis.py     Claude API — recommendation generation ONLY
 │   ├── knowledge.py     Chunking + Ollama embeddings + sqlite-vec (Phase 2)
+│   ├── evaluation.py    Adversarial evaluator — separate Claude call (Phase 3)
 │   ├── artifacts.py     Markdown/JSON output writers
 │   └── orchestration.py ThreadPoolExecutor harness + SQLite work queue
 ├── mcp/           Thin wrapper. Delegates ALL logic to core. No business logic here.
@@ -55,12 +56,13 @@ Every MCP tool call is rejected if the session is in the wrong state. No excepti
 
 ```
 UNATTACHED
-  → ATTACHED                (attach_repository)
-  → READ_ONLY_CONFIRMED     (confirm_guardrails — mandatory human gate)
-  → ANALYSIS_IN_PROGRESS    (start_full_mapping)
-  → ANALYSIS_COMPLETE       (generate_recommendations completes)
-  → IMPLEMENTATION_PLANNED  (Phase 4: user approves specific recs)
-  → WORKING_REPO_READY      (Phase 4: target directory created)
+  → ATTACHED                        (attach_repository)
+  → READ_ONLY_CONFIRMED             (confirm_guardrails — mandatory human gate)
+  → ANALYSIS_IN_PROGRESS            (start_full_mapping)
+  → RECOMMENDATIONS_PENDING_REVIEW  (generate_recommendations — evaluator ran)
+  → ANALYSIS_COMPLETE               (review_recommendations — human accepted/rejected)
+  → IMPLEMENTATION_PLANNED          (Phase 4: user approves specific recs)
+  → WORKING_REPO_READY              (Phase 4: target directory created)
 ```
 
 ## The four trust zones

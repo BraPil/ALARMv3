@@ -26,6 +26,7 @@ EXPECTED_TOOLS = {
     "run_analysis",
     "generate_recommendations",
     "query_codebase",
+    "review_recommendations",
 }
 
 
@@ -60,6 +61,7 @@ EXPECTED_RESOURCES = {
     "session://current",
     "manifest://files",
     "recommendations://latest",
+    "recommendations://evaluated",
 }
 
 

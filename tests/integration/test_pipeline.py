@@ -195,6 +195,9 @@ def test_state_machine_full_walk(workspace):
     with ThreadPoolExecutor(max_workers=2) as pool:
         Analyzer(session).run(pool, "analyze")
 
+    session.transition_to(SessionState.RECOMMENDATIONS_PENDING_REVIEW)
+    assert session.state == SessionState.RECOMMENDATIONS_PENDING_REVIEW
+
     session.transition_to(SessionState.ANALYSIS_COMPLETE)
     assert session.state == SessionState.ANALYSIS_COMPLETE
 

@@ -20,12 +20,13 @@ def test_valid_transition(g):
 
 def test_full_chain(g):
     chain = [
-        (SessionState.UNATTACHED,          SessionState.ATTACHED),
-        (SessionState.ATTACHED,            SessionState.READ_ONLY_CONFIRMED),
-        (SessionState.READ_ONLY_CONFIRMED, SessionState.ANALYSIS_IN_PROGRESS),
-        (SessionState.ANALYSIS_IN_PROGRESS,SessionState.ANALYSIS_COMPLETE),
-        (SessionState.ANALYSIS_COMPLETE,   SessionState.IMPLEMENTATION_PLANNED),
-        (SessionState.IMPLEMENTATION_PLANNED, SessionState.WORKING_REPO_READY),
+        (SessionState.UNATTACHED,                     SessionState.ATTACHED),
+        (SessionState.ATTACHED,                       SessionState.READ_ONLY_CONFIRMED),
+        (SessionState.READ_ONLY_CONFIRMED,            SessionState.ANALYSIS_IN_PROGRESS),
+        (SessionState.ANALYSIS_IN_PROGRESS,           SessionState.RECOMMENDATIONS_PENDING_REVIEW),
+        (SessionState.RECOMMENDATIONS_PENDING_REVIEW, SessionState.ANALYSIS_COMPLETE),
+        (SessionState.ANALYSIS_COMPLETE,              SessionState.IMPLEMENTATION_PLANNED),
+        (SessionState.IMPLEMENTATION_PLANNED,         SessionState.WORKING_REPO_READY),
     ]
     for from_state, to_state in chain:
         assert g.transition(from_state, to_state) == to_state
