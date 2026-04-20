@@ -44,10 +44,19 @@ ALARMv3/
 │   ├── alarmv1_analysis.md     # Deep dive into ALARMv1
 │   ├── alarmv2_analysis.md     # Deep dive into ALARMv2
 │   └── comparative_analysis.md # Comparison and synthesis
-└── planning/                    # Planning and design documents
-    ├── vision_and_requirements.md    # Vision, personas, features
-    ├── technical_architecture.md     # System architecture
-    └── mvp_scope.md                  # MVP definition and plan
+├── planning/                    # Planning and design documents
+│   ├── vision_and_requirements.md    # Vision, personas, features
+│   ├── technical_architecture.md     # System architecture
+│   └── mvp_scope.md                  # MVP definition and plan
+├── docs/                        # POC documentation
+│   ├── POC_PLAN_ALARMv3.md     # POC scope and timeline
+│   ├── METRICS.md               # Performance metrics template
+│   └── EXPERIMENT_MATRIX.md     # Experiment tracking
+└── scripts/                     # POC scripts
+    ├── setup_env.sh             # Environment setup
+    ├── run_index_and_log.sh     # Indexing pipeline
+    ├── count_chroma.py          # Vector counting
+    └── measure_cli_query.sh     # Latency measurement
 ```
 
 ## Research Documents
@@ -100,6 +109,66 @@ Implementation plan for the first release:
 - Dependencies and success metrics
 - Post-MVP roadmap
 
+## POC (Proof of Concept)
+
+In parallel with the planning phase, we've developed a POC framework to validate key design choices for ALARMv3. See [docs/POC_PLAN_ALARMv3.md](docs/POC_PLAN_ALARMv3.md) for details.
+
+### POC Goals
+
+1. **Reproducible indexing pipeline**: Measure index time, chunk/vector counts, and database size
+2. **Retrieval quality vs model choice**: Compare embedding models (all-MiniLM vs CodeBERT)
+3. **Vector DB feasibility**: Pilot Postgres+pgvector, Chroma, and FAISS prototypes
+4. **Serving & latency**: Measure CLI/HTTP query latency and validate SLOs (target p95 < 200ms)
+5. **Monitoring & drift baseline**: Produce similarity histograms and drift detection metrics
+6. **CI/CD & reproducibility**: Ensure MLflow records dataset snapshots, docker tags, and git SHAs
+
+### Quick Start
+
+1. **Setup Environment**
+   ```bash
+   ./scripts/setup_env.sh
+   source .venv/bin/activate
+   ```
+
+2. **Run Indexing Pipeline**
+   ```bash
+   # Create a demo app or use an existing codebase
+   mkdir -p /tmp/demo_app
+   echo "# Demo code" > /tmp/demo_app/main.py
+   
+   # Run indexing
+   ./scripts/run_index_and_log.sh /tmp/demo_app ./out
+   ```
+
+3. **Count Vectors in Database**
+   ```bash
+   python scripts/count_chroma.py ./out/rag_db
+   ```
+
+4. **Measure Query Latency**
+   ```bash
+   # Find session_id from the created session file name
+   SESSION_ID=$(ls ./out/session_*.json | head -1 | sed 's/.*session_//' | sed 's/.json//')
+   
+   # Measure latency with 100 queries
+   ./scripts/measure_cli_query.sh $SESSION_ID "How does authentication work?" 100
+   ```
+
+### POC Documentation
+
+- **[POC Plan](docs/POC_PLAN_ALARMv3.md)** - Scope, timeline, and acceptance criteria
+- **[Metrics](docs/METRICS.md)** - Operational and quality metrics template
+- **[Experiment Matrix](docs/EXPERIMENT_MATRIX.md)** - Experiment tracking structure
+
+### POC Scripts
+
+- `scripts/setup_env.sh` - Virtual environment setup with ML dependencies
+- `scripts/run_index_and_log.sh` - Indexing pipeline with timestamped logging
+- `scripts/count_chroma.py` - Vector and storage size measurement
+- `scripts/measure_cli_query.sh` - Query latency benchmarking with SLO validation
+
+Scripts produce structured JSON output for metrics aggregation. Session files track app_path, db_path, chunk counts, and duration for reproducibility.
+
 ## Key Insights
 
 ### What Makes v3 Different
@@ -129,12 +198,18 @@ ALARMv3 aims to combine:
    - Scoped MVP
    - Created timeline
 
-3. 🔄 **Validation Phase** (Next)
+3. 🔄 **POC Phase** (In Progress)
+   - Validate embedding model choices
+   - Compare vector DB options
+   - Measure retrieval quality and latency
+   - Establish monitoring baselines
+
+4. 🔄 **Validation Phase** (Next)
    - Review with stakeholders
    - Gather feedback on approach
    - Refine scope based on input
 
-4. ⏳ **Implementation Phase** (Upcoming)
+5. ⏳ **Implementation Phase** (Upcoming)
    - Build MVP core
    - Iterate based on testing
    - Release v0.1.0
@@ -148,6 +223,7 @@ Areas where input would be valuable:
 - Feature prioritization
 - Technology stack choices
 - Architecture design patterns
+- POC experiment results and insights
 
 ## License
 
@@ -159,4 +235,4 @@ For questions or feedback, please open an issue in this repository.
 
 ---
 
-**Note**: No code implementation exists yet. This repository contains only research and planning documents. Implementation will begin after the planning phase is validated and refined based on feedback.
+**Note**: This repository is primarily research and planning documents with a POC framework for validation. Full implementation will begin after the planning and POC phases are validated and refined based on feedback.
