@@ -4,12 +4,22 @@
 
 ALARMv3 is designed as a modular, extensible platform that balances simplicity with power. The architecture emphasizes progressive enhancement: works immediately with minimal setup, but supports advanced features when needed.
 
+This architecture now assumes an **MCP-first operating model**: the core engine remains reusable as a Python library, while an MCP server becomes the primary interactive surface for repository attachment, guardrail confirmation, analysis, knowledge generation, and optional implementation orchestration.
+
 ## Architectural Layers
 
 ### Layer 1: Interface Layer
 **Purpose**: User interaction and command execution
 
 ```
+┌─────────────────────────────────────┐
+│         MCP Server Interface        │
+│  • Tools                            │
+│  • Resources                        │
+│  • Prompts                          │
+│  • Progress events                  │
+└─────────────────────────────────────┘
+           │
 ┌─────────────────────────────────────┐
 │         CLI Interface               │
 │  • Commands (analyze, plan, track)  │
@@ -26,6 +36,7 @@ ALARMv3 is designed as a modular, extensible platform that balances simplicity w
 ```
 
 **Technologies:**
+- MCP server: Python MCP SDK or equivalent protocol implementation
 - CLI: Click or Typer
 - Web: FastAPI + React (optional, future phase)
 
@@ -49,6 +60,11 @@ ALARMv3 is designed as a modular, extensible platform that balances simplicity w
 - SQLite for session data
 - JSON for analysis results
 - YAML for configuration
+
+Additional MCP-first requirements:
+- persistent guardrail state per session
+- repository fingerprinting and provenance capture
+- deterministic artifact paths for local-first output
 
 **Key Entities:**
 ```python
@@ -120,6 +136,11 @@ MigrationRoadmap
 - **tree-sitter**: Primary parser (universal, fast)
 - **Language-specific AST**: Fallback for deeper analysis
 - **Regex patterns**: Quick heuristics
+
+MCP-first additions:
+- immutable traversal manifest before deep analysis
+- coverage accounting for discovered, eligible, and analyzed files
+- provenance records for each worker-produced artifact
 
 **Metrics Collected:**
 ```python
@@ -233,6 +254,24 @@ Recommendation
 - JSON (for API/integration)
 - PDF (generated from HTML)
 
+JSON should be treated as the source of truth for all session artifacts, with Markdown generated as a human-readable projection.
+
+## MCP-First Product Boundaries
+
+### ALARM Core Engine
+- pure Python library
+- scanning, analysis, synthesis, recommendations, artifacts, index, orchestration
+
+### ALARM MCP Wrapper
+- tools/resources/prompts over the core engine
+- user interaction state and progress events
+- read-only analysis guardrails and audit trail
+
+### Sync Adapters
+- LocalFS adapter first
+- SharePoint adapter later
+- never in the critical path for analysis completion
+
 ## Data Flow
 
 ### Analysis Workflow
@@ -289,6 +328,39 @@ Subsequent Runs:
   → Recalculate affected metrics
   → Compare with baseline
 ```
+
+## Deterministic Local Artifact Layout
+
+Recommended session layout:
+
+```text
+.alarmv3/
+└── sessions/
+    └── <session_id>/
+        ├── manifest/
+        ├── graphs/
+        ├── analysis/
+        ├── knowledge/
+        ├── recommendations/
+        ├── orchestration/
+        ├── policy/
+        └── index.db
+```
+
+This layout supports local-first operation, resumable sessions, and future sync adapters.
+
+## MCP Resources and Prompt Surfaces
+
+Primary MCP resources should expose repository trees, graphs, findings, knowledge artifacts, recommendations, guardrails, progress, and provenance.
+
+Primary MCP prompts should cover:
+- guardrail confirmation
+- architecture explanation
+- modernization strategy generation
+- implementation swarm briefing
+- validation and test planning
+
+See `planning/mcp_server_spec.md` for the canonical contract.
 
 ## Extension Points
 
@@ -440,6 +512,8 @@ plugins:
 2. **Parallel Processing**
    - Analyze files in parallel
    - Use process pool for CPU-intensive tasks
+   - Partition work by directory shard, language, and file size class
+   - Record per-worker provenance and retry outcomes
 
 3. **Incremental Analysis**
    - Track file changes
@@ -472,6 +546,16 @@ plugins:
 3. **Resource Limits**: Enforce file size and count limits
 4. **Dependency Security**: Check dependencies for known vulnerabilities
 5. **Data Privacy**: Don't send code to external services by default
+6. **Guardrails**: Require explicit read-only confirmation before deep analysis
+7. **Repository Preservation**: Treat the attached legacy repository as archive/reference in analysis mode
+
+## Codespaces Considerations
+
+1. Require explicit repository attachment for the currently open workspace
+2. Keep artifacts local to the workspace or configured persistent storage
+3. Use bounded worker pools for constrained environments
+4. Support checkpoints and resume after Codespace restarts
+5. Keep cloud sync optional and outside the critical path
 
 ## Testing Strategy
 
