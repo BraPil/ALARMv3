@@ -398,3 +398,196 @@ def register_tools(mcp: FastMCP) -> None:
         except GuardrailViolation as e:
             g.log_error("review_recommendations", str(e))
             raise
+
+    @mcp.tool()
+    def plan_implementation(session_id: str, rec_ranks: list[int]) -> dict:
+        """Select accepted recommendations and create an ordered implementation plan.
+
+        Reads the accepted recommendations at the given ranks, orders them by
+        dependency (files shared across multiple recs are tackled first), and
+        stores a phase-by-phase implementation plan.
+
+        Requires state: ANALYSIS_COMPLETE. Only accepted recommendations can be planned.
+
+        Args:
+            session_id: The session ID.
+            rec_ranks: List of recommendation rank numbers to include in the plan.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("plan_implementation", {"session_id": session_id, "rec_ranks": rec_ranks})
+
+        try:
+            g.require_state(session.state, SessionState.ANALYSIS_COMPLETE)
+
+            from ..core.implementation import ImplementationPlanner
+            result = ImplementationPlanner(session).create_plan(rec_ranks)
+            session.transition_to(SessionState.IMPLEMENTATION_PLANNED)
+
+            return {
+                **result,
+                "state": session.state.value,
+                "message": (
+                    f"Implementation plan created: {result['plan_item_count']} items. "
+                    "Call clone_for_implementation to set up the working directory."
+                ),
+            }
+        except GuardrailViolation as e:
+            g.log_error("plan_implementation", str(e))
+            raise
+
+    @mcp.tool()
+    def clone_for_implementation(session_id: str, target_path: str) -> dict:
+        """Clone the source repository to a new working directory for implementation.
+
+        Copies the source repo to target_path (which must not exist). Sets up a
+        local git repo in the target so each accepted change gets its own commit.
+        The source repository is NEVER modified.
+
+        Requires state: IMPLEMENTATION_PLANNED.
+
+        Args:
+            session_id: The session ID.
+            target_path: Absolute path where the working copy will be created.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("clone_for_implementation", {"session_id": session_id, "target_path": target_path})
+
+        try:
+            g.require_state(session.state, SessionState.IMPLEMENTATION_PLANNED)
+
+            from pathlib import Path as _Path
+
+            from ..core.implementation import clone_source_to_target
+
+            source = session.source_path
+            if not source:
+                raise ValueError("No source path attached to session")
+
+            target = _Path(target_path).resolve()
+            g.assert_no_write_to_source(target, source)
+            clone_source_to_target(source, target)
+
+            session.set_metadata("target_path", str(target))
+            session.transition_to(SessionState.WORKING_REPO_READY)
+
+            return {
+                "session_id": session_id,
+                "state": session.state.value,
+                "target_path": str(target),
+                "message": (
+                    f"Working copy created at {target}. "
+                    "Call implement_next to begin applying changes."
+                ),
+            }
+        except GuardrailViolation as e:
+            g.log_error("clone_for_implementation", str(e))
+            raise
+
+    @mcp.tool()
+    def implement_next(session_id: str) -> dict:
+        """Generate the next code change through the plan/build/eval pipeline.
+
+        Takes the next pending plan item, loads only the affected files from the
+        working copy, runs three Claude calls (planner → builder → adversarial
+        evaluator), and returns the proposed diff with evaluation results.
+
+        Does NOT write any files. Call accept_change or reject_change after reviewing.
+        If a prior attempt was rejected, the feedback is automatically injected.
+
+        Requires state: WORKING_REPO_READY.
+
+        Args:
+            session_id: The session ID.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("implement_next", {"session_id": session_id})
+
+        try:
+            g.require_state(session.state, SessionState.WORKING_REPO_READY)
+
+            from ..core.implementation import ImplementationRunner
+            result = ImplementationRunner(session).run_next()
+            return {**result, "state": session.state.value}
+        except GuardrailViolation as e:
+            g.log_error("implement_next", str(e))
+            raise
+
+    @mcp.tool()
+    def accept_change(session_id: str, change_id: int) -> dict:
+        """Accept a generated code change and commit it to the working directory.
+
+        Applies the diff to the TARGET files and creates a git commit. The source
+        repository is never touched. Review the diff at implementation://changes
+        before calling this.
+
+        Requires state: WORKING_REPO_READY.
+
+        Args:
+            session_id: The session ID.
+            change_id: The change ID returned by implement_next.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("accept_change", {"session_id": session_id, "change_id": change_id})
+
+        try:
+            g.require_state(session.state, SessionState.WORKING_REPO_READY)
+
+            from ..core.implementation import ImplementationRunner
+            result = ImplementationRunner(session).accept_change(change_id)
+            return {**result, "state": session.state.value}
+        except GuardrailViolation as e:
+            g.log_error("accept_change", str(e))
+            raise
+
+    @mcp.tool()
+    def reject_change(session_id: str, change_id: int, feedback: str) -> dict:
+        """Reject a generated code change and provide feedback for retry.
+
+        Discards the proposed diff and stores your feedback. The next call to
+        implement_next will retry the same plan item with your feedback injected
+        into the context.
+
+        Requires state: WORKING_REPO_READY.
+
+        Args:
+            session_id: The session ID.
+            change_id: The change ID returned by implement_next.
+            feedback: Specific feedback explaining what was wrong and what to do instead.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("reject_change", {"session_id": session_id, "change_id": change_id})
+
+        try:
+            g.require_state(session.state, SessionState.WORKING_REPO_READY)
+
+            from ..core.implementation import ImplementationRunner
+            result = ImplementationRunner(session).reject_change(change_id, feedback)
+            return {**result, "state": session.state.value}
+        except GuardrailViolation as e:
+            g.log_error("reject_change", str(e))
+            raise

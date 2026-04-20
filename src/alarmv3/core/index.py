@@ -124,7 +124,47 @@ CREATE INDEX IF NOT EXISTS idx_recommendation_review
     ON recommendation(session_id, review_status);
 """
 
-_ALL_SCHEMAS = [_MANIFEST, _DEPENDENCY, _SYMBOL, _COMPLEXITY, _CHUNK, _RECOMMENDATION]
+_IMPLEMENTATION_PLAN = """
+CREATE TABLE IF NOT EXISTS implementation_plan (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL,
+    rec_rank        INTEGER NOT NULL,
+    title           TEXT NOT NULL,
+    affected_files  TEXT NOT NULL DEFAULT '[]',  -- JSON array
+    order_index     INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending | in_progress | complete | skipped
+    created_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_impl_plan_session
+    ON implementation_plan(session_id, order_index);
+CREATE INDEX IF NOT EXISTS idx_impl_plan_status
+    ON implementation_plan(session_id, status);
+"""
+
+_IMPLEMENTATION_CHANGE = """
+CREATE TABLE IF NOT EXISTS implementation_change (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL,
+    plan_item_id    INTEGER NOT NULL,
+    diff_text       TEXT,
+    eval_critique   TEXT,
+    eval_verdict    TEXT NOT NULL DEFAULT 'pending',  -- approve | flag | reject
+    review_status   TEXT NOT NULL DEFAULT 'pending_review',
+    feedback        TEXT,
+    commit_hash     TEXT,
+    created_at      REAL NOT NULL,
+    reviewed_at     REAL
+);
+CREATE INDEX IF NOT EXISTS idx_impl_change_session
+    ON implementation_change(session_id, plan_item_id);
+CREATE INDEX IF NOT EXISTS idx_impl_change_review
+    ON implementation_change(session_id, review_status);
+"""
+
+_ALL_SCHEMAS = [
+    _MANIFEST, _DEPENDENCY, _SYMBOL, _COMPLEXITY, _CHUNK,
+    _RECOMMENDATION, _IMPLEMENTATION_PLAN, _IMPLEMENTATION_CHANGE,
+]
 
 
 def init_analysis_db(db_path: Path) -> None:

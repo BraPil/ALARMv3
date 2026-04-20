@@ -27,6 +27,11 @@ EXPECTED_TOOLS = {
     "generate_recommendations",
     "query_codebase",
     "review_recommendations",
+    "plan_implementation",
+    "clone_for_implementation",
+    "implement_next",
+    "accept_change",
+    "reject_change",
 }
 
 
@@ -62,6 +67,8 @@ EXPECTED_RESOURCES = {
     "manifest://files",
     "recommendations://latest",
     "recommendations://evaluated",
+    "implementation://plan",
+    "implementation://changes",
 }
 
 

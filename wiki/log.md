@@ -4,6 +4,12 @@ Append-only. Most recent at top.
 
 ---
 
+## [2026-04-20] ingest | Phase 4 implementation complete
+Phase 4 shipped: implementation.py (plan/build/eval pipeline, git commit to TARGET), implementation_plan + implementation_change DB tables, 5 new MCP tools (plan_implementation, clone_for_implementation, implement_next, accept_change, reject_change), 2 new resources (implementation://plan, implementation://changes). 190 tests passing.
+Board consulted via AAA (Cole Medin + consensus + architecture recommendation) before implementation. Key decisions: git worktree clone for isolation, context discipline (load only affected files), human gate before every commit, retry-with-feedback loop on rejection.
+
+---
+
 ## [2026-04-20] ingest | Phase 3 implementation complete
 Phase 3 shipped: adversarial evaluator (evaluation.py), RECOMMENDATIONS_PENDING_REVIEW guardrail state, review_recommendations MCP tool, recommendations://evaluated resource, AAA grounding hook (AAA_REST_URL env var, degrades gracefully). 154 tests passing (no regressions). Ready for PR.
 AAA consulted via get_consensus + ask_persona before implementation — strong consensus for architectural separation of evaluator from synthesizer.
