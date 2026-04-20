@@ -57,3 +57,6 @@ chroma_db/
 .coverage
 htmlcov/
 .pytest_cache/
+
+# ALARMv3 runtime artifacts (sessions, analysis DBs, audit logs)
+.alarmv3/

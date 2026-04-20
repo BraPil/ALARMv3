@@ -1,0 +1,31 @@
+{
+  "servers": {
+    "alarmv3": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "alarmv3-mcp"],
+      "cwd": "/workspaces/ALARMv3",
+      "env": {
+        "ALARMV3_WORKSPACE": "/workspaces/ALARMv3",
+        "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}"
+      }
+    },
+    "aaa": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.api.mcp_server"],
+      "cwd": "/workspaces/Agentic-AI-Architect",
+      "env": {
+        "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "aaa_anthropic_key",
+      "type": "promptString",
+      "description": "Anthropic API key for AAA synthesis tools",
+      "password": true
+    }
+  ]
+}
