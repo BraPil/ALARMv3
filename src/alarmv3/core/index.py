@@ -5,6 +5,9 @@ code chunks, and recommendations — lives in a single analysis.db per session.
 WAL mode is mandatory for concurrent worker writes.
 """
 
+import sqlite3
+from pathlib import Path
+
 _MANIFEST = """
 CREATE TABLE IF NOT EXISTS manifest (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,35 +100,62 @@ CREATE INDEX IF NOT EXISTS idx_chunk_unembedded
 
 _RECOMMENDATION = """
 CREATE TABLE IF NOT EXISTS recommendation (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id     TEXT NOT NULL,
-    rank           INTEGER NOT NULL,
-    category       TEXT NOT NULL,   -- security | modernization | quality | dependency
-    severity       TEXT NOT NULL,   -- critical | high | medium | low
-    title          TEXT NOT NULL,
-    description    TEXT NOT NULL,
-    affected_files TEXT NOT NULL DEFAULT '[]',  -- JSON array of paths
-    effort         TEXT,                         -- S | M | L | XL
-    rationale      TEXT,
-    approved       INTEGER NOT NULL DEFAULT 0,
-    created_at     REAL NOT NULL
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          TEXT NOT NULL,
+    rank                INTEGER NOT NULL,
+    category            TEXT NOT NULL,   -- security | modernization | quality | dependency
+    severity            TEXT NOT NULL,   -- critical | high | medium | low
+    title               TEXT NOT NULL,
+    description         TEXT NOT NULL,
+    affected_files      TEXT NOT NULL DEFAULT '[]',  -- JSON array of paths
+    effort              TEXT,                         -- S | M | L | XL (synthesizer estimate)
+    rationale           TEXT,
+    approved            INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    risk_score          INTEGER,                      -- 1-5 from evaluator (Phase 3)
+    evaluator_effort    TEXT,                         -- S | M | L | XL from evaluator
+    evaluator_critique  TEXT,                         -- evaluator critique text
+    evaluator_verdict   TEXT NOT NULL DEFAULT 'pending',  -- pending | accept | revise | reject
+    review_status       TEXT NOT NULL DEFAULT 'pending'   -- pending | accepted | rejected (human)
 );
 CREATE INDEX IF NOT EXISTS idx_recommendation_session
     ON recommendation(session_id, rank);
+CREATE INDEX IF NOT EXISTS idx_recommendation_review
+    ON recommendation(session_id, review_status);
 """
 
 _ALL_SCHEMAS = [_MANIFEST, _DEPENDENCY, _SYMBOL, _COMPLEXITY, _CHUNK, _RECOMMENDATION]
 
 
-def init_analysis_db(db_path: "Path") -> None:
+def init_analysis_db(db_path: Path) -> None:
     """Create or migrate the analysis database at db_path."""
-    import sqlite3
     conn = sqlite3.connect(db_path, timeout=10)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         for schema in _ALL_SCHEMAS:
             conn.executescript(schema)
+        _migrate_recommendation_phase3(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate_recommendation_phase3(conn: sqlite3.Connection) -> None:
+    """Add Phase 3 evaluator columns to existing recommendation tables."""
+    new_columns = [
+        ("risk_score",         "INTEGER"),
+        ("evaluator_effort",   "TEXT"),
+        ("evaluator_critique", "TEXT"),
+        ("evaluator_verdict",  "TEXT NOT NULL DEFAULT 'pending'"),
+        ("review_status",      "TEXT NOT NULL DEFAULT 'pending'"),
+    ]
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(recommendation)").fetchall()
+    }
+    for col_name, col_def in new_columns:
+        if col_name not in existing:
+            conn.execute(
+                f"ALTER TABLE recommendation ADD COLUMN {col_name} {col_def}"
+            )

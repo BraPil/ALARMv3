@@ -52,7 +52,7 @@ def register_resources(mcp: FastMCP) -> None:
 
     @mcp.resource("recommendations://latest")
     def recommendations_latest() -> str:
-        """Latest prioritized modernization recommendations."""
+        """Latest prioritized modernization recommendations (accepted only)."""
         sm = SessionManager(_workspace())
         session = sm.get()
         if not session:
@@ -65,7 +65,41 @@ def register_resources(mcp: FastMCP) -> None:
         try:
             rows = conn.execute(
                 "SELECT rank, category, severity, title, description, "
-                "affected_files, effort, rationale, approved "
+                "affected_files, effort, rationale, approved, review_status "
+                "FROM recommendation WHERE session_id=? ORDER BY rank",
+                (session.session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["affected_files"] = json.loads(d["affected_files"])
+            result.append(d)
+        return json.dumps(result, indent=2)
+
+    @mcp.resource("recommendations://evaluated")
+    def recommendations_evaluated() -> str:
+        """Recommendations with adversarial evaluator critique and scores.
+
+        Available after generate_recommendations completes (state:
+        RECOMMENDATIONS_PENDING_REVIEW). Review this before calling
+        review_recommendations to accept or reject each item.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session:
+            return json.dumps({"error": "No active session."})
+        db_path = session.artifact_dir / "analysis.db"
+        if not db_path.exists():
+            return json.dumps({"error": "No analysis database found."})
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT rank, category, severity, title, description, affected_files, "
+                "effort, rationale, risk_score, evaluator_effort, evaluator_critique, "
+                "evaluator_verdict, review_status "
                 "FROM recommendation WHERE session_id=? ORDER BY rank",
                 (session.session_id,),
             ).fetchall()

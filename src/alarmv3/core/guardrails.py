@@ -5,12 +5,12 @@ require_state() before executing. Violations raise GuardrailViolation
 which the MCP layer propagates as a tool error — the LLM cannot bypass this.
 """
 
-from enum import Enum
-from pathlib import Path
-from typing import Optional
 import json
 import threading
 import time
+from enum import Enum
+from pathlib import Path
+from typing import Optional
 
 
 class SessionState(str, Enum):
@@ -18,6 +18,7 @@ class SessionState(str, Enum):
     ATTACHED = "ATTACHED"
     READ_ONLY_CONFIRMED = "READ_ONLY_CONFIRMED"
     ANALYSIS_IN_PROGRESS = "ANALYSIS_IN_PROGRESS"
+    RECOMMENDATIONS_PENDING_REVIEW = "RECOMMENDATIONS_PENDING_REVIEW"
     ANALYSIS_COMPLETE = "ANALYSIS_COMPLETE"
     IMPLEMENTATION_PLANNED = "IMPLEMENTATION_PLANNED"
     WORKING_REPO_READY = "WORKING_REPO_READY"
@@ -25,18 +26,20 @@ class SessionState(str, Enum):
 
 # The only permitted state transitions — enforced at the MCP layer.
 _TRANSITIONS: dict[SessionState, list[SessionState]] = {
-    SessionState.UNATTACHED:            [SessionState.ATTACHED],
-    SessionState.ATTACHED:              [SessionState.READ_ONLY_CONFIRMED],
-    SessionState.READ_ONLY_CONFIRMED:   [SessionState.ANALYSIS_IN_PROGRESS],
-    SessionState.ANALYSIS_IN_PROGRESS:  [SessionState.ANALYSIS_COMPLETE],
-    SessionState.ANALYSIS_COMPLETE:     [SessionState.IMPLEMENTATION_PLANNED],
-    SessionState.IMPLEMENTATION_PLANNED:[SessionState.WORKING_REPO_READY],
-    SessionState.WORKING_REPO_READY:    [],
+    SessionState.UNATTACHED:                       [SessionState.ATTACHED],
+    SessionState.ATTACHED:                         [SessionState.READ_ONLY_CONFIRMED],
+    SessionState.READ_ONLY_CONFIRMED:              [SessionState.ANALYSIS_IN_PROGRESS],
+    SessionState.ANALYSIS_IN_PROGRESS:             [SessionState.RECOMMENDATIONS_PENDING_REVIEW],
+    SessionState.RECOMMENDATIONS_PENDING_REVIEW:   [SessionState.ANALYSIS_COMPLETE],
+    SessionState.ANALYSIS_COMPLETE:                [SessionState.IMPLEMENTATION_PLANNED],
+    SessionState.IMPLEMENTATION_PLANNED:           [SessionState.WORKING_REPO_READY],
+    SessionState.WORKING_REPO_READY:               [],
 }
 
 
 # States where knowledge querying is permitted
 ANALYSIS_COMPLETE_STATES = [
+    SessionState.RECOMMENDATIONS_PENDING_REVIEW,
     SessionState.ANALYSIS_COMPLETE,
     SessionState.IMPLEMENTATION_PLANNED,
     SessionState.WORKING_REPO_READY,

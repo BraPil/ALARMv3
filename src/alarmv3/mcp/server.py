@@ -13,9 +13,9 @@ Register with Claude Code by adding to .mcp.json:
 
 from mcp.server.fastmcp import FastMCP
 
-from .tools import register_tools
-from .resources import register_resources
 from .prompts import register_prompts
+from .resources import register_resources
+from .tools import register_tools
 
 mcp = FastMCP(
     "alarmv3",

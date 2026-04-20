@@ -23,10 +23,11 @@ ALARMv3 attaches to a legacy codebase (as a read-only archive), maps it, analyze
 
 ```
 UNATTACHED → ATTACHED → READ_ONLY_CONFIRMED → ANALYSIS_IN_PROGRESS
-→ ANALYSIS_COMPLETE → IMPLEMENTATION_PLANNED → WORKING_REPO_READY
+→ RECOMMENDATIONS_PENDING_REVIEW → ANALYSIS_COMPLETE
+→ IMPLEMENTATION_PLANNED → WORKING_REPO_READY
 ```
 
-Phase 2 adds a `KNOWLEDGE_BUILT` state between `ANALYSIS_COMPLETE` and `IMPLEMENTATION_PLANNED`.
+Phase 3 adds `RECOMMENDATIONS_PENDING_REVIEW` between `ANALYSIS_IN_PROGRESS` and `ANALYSIS_COMPLETE` — the adversarial evaluator runs automatically, then `review_recommendations` lets the human accept or reject before recommendations are finalized.
 
 ## MCP tools
 
@@ -39,6 +40,7 @@ Phase 2 adds a `KNOWLEDGE_BUILT` state between `ANALYSIS_COMPLETE` and `IMPLEMEN
 | `run_analysis` | ANALYSIS_IN_PROGRESS | tree-sitter parse, dependency graph, complexity |
 | `generate_recommendations` | ANALYSIS_IN_PROGRESS | Claude synthesis → ranked recommendations |
 | `query_codebase` | ANALYSIS_COMPLETE+ | *(Phase 2)* Natural language RAG over code |
+| `review_recommendations` | RECOMMENDATIONS_PENDING_REVIEW | *(Phase 3)* Human accept/reject gate after adversarial evaluation |
 
 ## MCP resources
 
@@ -46,7 +48,8 @@ Phase 2 adds a `KNOWLEDGE_BUILT` state between `ANALYSIS_COMPLETE` and `IMPLEMEN
 |-----|---------|
 | `session://current` | Current session state and metadata |
 | `manifest://files` | All discovered files with language/size |
-| `recommendations://latest` | Full ranked recommendation set |
+| `recommendations://latest` | Full ranked recommendation set with review status |
+| `recommendations://evaluated` | *(Phase 3)* Recommendations with adversarial critique and scores |
 
 ## Storage layout
 
@@ -70,7 +73,7 @@ Phase 2 adds a `KNOWLEDGE_BUILT` state between `ANALYSIS_COMPLETE` and `IMPLEMEN
 
 ## Current status
 
-**Phase 1 complete** (2026-04-20). Working MCP server, CLI, and 115-test suite (105 unit/integration + 10 live API). Phase 2 branch open: RAG layer with sqlite-vec + Ollama.
+**Phase 3 complete** (2026-04-20). Adversarial evaluator (`core/evaluation.py`), `RECOMMENDATIONS_PENDING_REVIEW` guardrail state, `review_recommendations` MCP tool, `recommendations://evaluated` resource, AAA grounding hook, and 154-test suite.
 
 ## See also
 - [Phase 1 Implementation](phase1-implementation.md) — what was built, test results, live synthesis output

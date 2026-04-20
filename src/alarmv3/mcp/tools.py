@@ -6,17 +6,44 @@ Every tool call:
 3. Propagates GuardrailViolation as a tool error (LLM cannot bypass)
 """
 
+import json
 import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from ..core.guardrails import ANALYSIS_COMPLETE_STATES, GuardrailViolation, SessionState
 from ..core.session import SessionManager
-from ..core.guardrails import SessionState, GuardrailViolation, ANALYSIS_COMPLETE_STATES
 
 
 def _workspace() -> Path:
     return Path(os.environ.get("ALARMV3_WORKSPACE", Path.cwd()))
+
+
+def _try_aaa_grounding(problem_summary: str) -> "str | None":
+    """Best-effort call to AAA REST API for architecture grounding.
+
+    Reads AAA_REST_URL from environment (e.g. http://localhost:8080).
+    Returns None silently if AAA is unavailable — never blocks synthesis.
+    """
+    base_url = os.environ.get("AAA_REST_URL", "").rstrip("/")
+    if not base_url:
+        return None
+    try:
+        payload = json.dumps({"problem_statement": problem_summary}).encode()
+        req = urllib.request.Request(
+            f"{base_url}/v1/architecture-recommendation",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            return data.get("recommendation", "")
+    except Exception:
+        return None
 
 
 def _knowledge_built(session) -> bool:
@@ -226,9 +253,18 @@ def register_tools(mcp: FastMCP) -> None:
         try:
             g.require_state(session.state, SessionState.ANALYSIS_IN_PROGRESS)
 
+            aaa_grounding = _try_aaa_grounding(
+                f"Legacy codebase at {session.source_path}: "
+                "generate prioritized modernization recommendations"
+            )
+            if aaa_grounding:
+                g.log_tool_call("aaa_grounding_fetched", {"chars": len(aaa_grounding)})
+
             from ..core.orchestration import Orchestrator
-            result = Orchestrator(session).synthesize_recommendations()
-            session.transition_to(SessionState.ANALYSIS_COMPLETE)
+            result = Orchestrator(session).synthesize_recommendations(
+                aaa_grounding=aaa_grounding
+            )
+            session.transition_to(SessionState.RECOMMENDATIONS_PENDING_REVIEW)
 
             return {**result, "state": session.state.value}
         except GuardrailViolation as e:
@@ -264,7 +300,7 @@ def register_tools(mcp: FastMCP) -> None:
             g.require_state_in(session.state, ANALYSIS_COMPLETE_STATES)
             top_k = min(max(1, top_k), 50)
 
-            from ..core.knowledge import KnowledgeBuilder, OllamaUnavailableError
+            from ..core.knowledge import KnowledgeBuilder
             kb = KnowledgeBuilder(session)
 
             # Lazy build: embed on first query if not already done
@@ -282,4 +318,83 @@ def register_tools(mcp: FastMCP) -> None:
             }
         except GuardrailViolation as e:
             g.log_error("query_codebase", str(e))
+            raise
+
+    @mcp.tool()
+    def review_recommendations(
+        session_id: str,
+        accept_ids: list[int],
+        reject_ids: list[int],
+    ) -> dict:
+        """Human review gate: accept or reject evaluated recommendations.
+
+        After generate_recommendations runs the adversarial evaluator, call this
+        tool to record your decisions. Review the evaluator critique first at
+        recommendations://evaluated. Accepted recommendations are stored and
+        available for implementation planning. Rejected recommendations are
+        archived.
+
+        Requires state: RECOMMENDATIONS_PENDING_REVIEW.
+
+        Args:
+            session_id: The session ID.
+            accept_ids: List of recommendation rank numbers to accept.
+            reject_ids: List of recommendation rank numbers to reject.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call(
+            "review_recommendations",
+            {"session_id": session_id, "accept_ids": accept_ids, "reject_ids": reject_ids},
+        )
+
+        try:
+            g.require_state(session.state, SessionState.RECOMMENDATIONS_PENDING_REVIEW)
+
+            import sqlite3
+            db_path = session.artifact_dir / "analysis.db"
+            conn = sqlite3.connect(db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                for rank in accept_ids:
+                    conn.execute(
+                        "UPDATE recommendation SET review_status='accepted', approved=1 "
+                        "WHERE session_id=? AND rank=?",
+                        (session_id, rank),
+                    )
+                for rank in reject_ids:
+                    conn.execute(
+                        "UPDATE recommendation SET review_status='rejected' "
+                        "WHERE session_id=? AND rank=?",
+                        (session_id, rank),
+                    )
+                accepted_count = conn.execute(
+                    "SELECT COUNT(*) FROM recommendation "
+                    "WHERE session_id=? AND review_status='accepted'",
+                    (session_id,),
+                ).fetchone()[0]
+                conn.commit()
+            finally:
+                conn.close()
+
+            session.transition_to(SessionState.ANALYSIS_COMPLETE)
+
+            return {
+                "session_id": session_id,
+                "state": session.state.value,
+                "accepted": len(accept_ids),
+                "rejected": len(reject_ids),
+                "total_accepted": accepted_count,
+                "message": (
+                    f"Review complete. {accepted_count} recommendations accepted. "
+                    "Full results at recommendations://latest. "
+                    "Proceed to implementation planning when ready."
+                ),
+            }
+        except GuardrailViolation as e:
+            g.log_error("review_recommendations", str(e))
             raise

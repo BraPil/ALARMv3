@@ -7,7 +7,6 @@ One session per workspace (Phase 1). Session state and work queue live in
 
 import json
 import sqlite3
-import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -15,7 +14,6 @@ from pathlib import Path
 from typing import Optional
 
 from .guardrails import GuardrailsManager, SessionState
-
 
 _SESSION_SCHEMA = """
 PRAGMA journal_mode=WAL;

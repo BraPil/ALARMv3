@@ -11,7 +11,6 @@ architecture at machine speed.
 import json
 import sqlite3
 import time
-from pathlib import Path
 
 import anthropic
 
@@ -68,17 +67,20 @@ class Synthesizer:
         self._session = session
         self._db_path = session.artifact_dir / "analysis.db"
 
-    def run(self) -> dict:
+    def run(self, aaa_grounding: "str | None" = None) -> dict:
         context = self._build_context()
+        if aaa_grounding:
+            context["aaa_architecture_grounding"] = aaa_grounding
         recommendations = self._call_claude(context)
         self._store(recommendations)
         return {
             "session_id": self._session.session_id,
             "recommendation_count": len(recommendations),
+            "recommendations": recommendations,
             "top_recommendations": recommendations[:5],
             "message": (
-                f"Generated {len(recommendations)} recommendations. "
-                "Full list available at recommendations://latest"
+                f"Generated {len(recommendations)} draft recommendations. "
+                "Evaluator running — review at recommendations://evaluated"
             ),
         }
 

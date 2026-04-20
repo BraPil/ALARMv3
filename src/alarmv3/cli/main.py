@@ -12,8 +12,8 @@ from pathlib import Path
 
 import click
 from rich.console import Console
-from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 
 console = Console()
 
@@ -35,12 +35,12 @@ def analyze(source_path: str, workspace: str, workers: int):
     """Attach to SOURCE_PATH and run full analysis end-to-end."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from ..core.session import SessionManager
-    from ..core.guardrails import SessionState, GuardrailViolation
-    from ..core.discovery import FileScanner
     from ..core.analysis import Analyzer
-    from ..core.synthesis import Synthesizer
     from ..core.artifacts import ArtifactWriter
+    from ..core.discovery import FileScanner
+    from ..core.guardrails import GuardrailViolation, SessionState
+    from ..core.session import SessionManager
+    from ..core.synthesis import Synthesizer
 
     sm = SessionManager(Path(workspace))
     session = sm.get_or_create()
@@ -172,7 +172,6 @@ def status(workspace: str):
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _print_recommendations(session) -> None:
-    import json
     import sqlite3
 
     db_path = session.artifact_dir / "analysis.db"
