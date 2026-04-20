@@ -4,6 +4,14 @@ Append-only. Most recent at top.
 
 ---
 
+## [2026-04-20] ingest | Phase 2 merged + Phase 3 branch open
+Phase 2 shipped: RAG layer (sqlite-vec + Ollama nomic-embed-text), structure-aware chunking, `query_codebase` MCP tool, full test suite. PR #4 merged to main. Phase 3 branch `phase-3/adversarial-evaluator` created.
+AAA Board consulted (Cole Medin + consensus across Medin/Weng/Huyen/Willison) for Phase 3 design. Strong consensus: adversarial evaluator must be architecturally separated from synthesis; human review gate required before recommendations stored.
+Pages added: project/phase3-plan.md
+Pages updated: index.md (+1 page, count 13), architecture/board-decisions.md (Phase 3 scope)
+
+---
+
 ## [2026-04-20] ingest | Phase 1 complete + Phase 2 branch open
 Phase 1 shipped: 44 files, 5698 lines, 115 tests passing (105 unit/integration + 10 live API). Ollama installed and verified in Codespace (nomic-embed-text, 768-dim, CPU). Phase 2 branch `phase-2/rag-query-codebase` created.
 Pages added: project/phase1-implementation.md, project/phase2-plan.md, tools/ollama-codespaces.md
