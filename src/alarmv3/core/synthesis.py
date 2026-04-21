@@ -71,6 +71,10 @@ class Synthesizer:
         context = self._build_context()
         if aaa_grounding:
             context["aaa_architecture_grounding"] = aaa_grounding
+        from .memory import ProjectMemory
+        memory_text = ProjectMemory(self._session.alarm_dir).format_for_prompt()
+        if memory_text:
+            context["project_memory"] = memory_text
         recommendations = self._call_claude(context)
         self._store(recommendations)
         return {

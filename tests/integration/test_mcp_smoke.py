@@ -32,6 +32,13 @@ EXPECTED_TOOLS = {
     "implement_next",
     "accept_change",
     "reject_change",
+    # Phase 5
+    "implement_batch",
+    "record_project_memory",
+    "list_project_memory",
+    "get_autopilot_policy",
+    "register_repo",
+    "query_cross_repo",
 }
 
 

@@ -591,3 +591,238 @@ def register_tools(mcp: FastMCP) -> None:
         except GuardrailViolation as e:
             g.log_error("reject_change", str(e))
             raise
+
+    # ── Phase 5 tools ──────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def implement_batch(session_id: str, max_concurrent: int = 3) -> dict:
+        """Run plan/build/eval for all pending items, parallelising independent ones.
+
+        Items whose affected files do not overlap are dispatched concurrently using
+        a thread pool. Items that share files are serialised to prevent conflicting
+        patches. Returns results for all items — auto-accepted changes are committed
+        automatically; others require accept_change / reject_change.
+
+        Requires state: WORKING_REPO_READY.
+
+        Args:
+            session_id: The session ID.
+            max_concurrent: Max parallel workers per batch (default 3, max 8).
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("implement_batch", {"session_id": session_id, "max_concurrent": max_concurrent})
+
+        try:
+            g.require_state(session.state, SessionState.WORKING_REPO_READY)
+            max_concurrent = min(max(1, max_concurrent), 8)
+
+            from ..core.implementation import ImplementationRunner
+            results = ImplementationRunner(session).run_batch(max_concurrent)
+
+            pending_review = [r for r in results if not r.get("auto_accepted") and "error" not in r]
+            auto_accepted = [r for r in results if r.get("auto_accepted")]
+            errors = [r for r in results if "error" in r]
+
+            return {
+                "state": session.state.value,
+                "total": len(results),
+                "auto_accepted": len(auto_accepted),
+                "pending_review": len(pending_review),
+                "errors": len(errors),
+                "results": results,
+                "message": (
+                    f"Batch complete: {len(auto_accepted)} auto-accepted, "
+                    f"{len(pending_review)} awaiting review, {len(errors)} errors."
+                ),
+            }
+        except GuardrailViolation as e:
+            g.log_error("implement_batch", str(e))
+            raise
+
+    @mcp.tool()
+    def record_project_memory(
+        session_id: str,
+        category: str,
+        key: str,
+        content: str,
+    ) -> dict:
+        """Record a convention, decision, anti-pattern, or pattern to persistent project memory.
+
+        Memory entries survive across sessions and are injected into synthesis and
+        implementation prompts so accumulated knowledge influences future recommendations.
+
+        Categories:
+          - convention: coding style or naming rules discovered in this codebase
+          - decision: architecture decisions (e.g., "we use Repository pattern, not Active Record")
+          - antipattern: patterns to avoid (e.g., "do not use global singletons for state")
+          - pattern: established patterns to follow (e.g., "all services use constructor injection")
+
+        Args:
+            session_id: The session ID (for audit attribution).
+            category: One of: convention, decision, antipattern, pattern.
+            key: Short unique identifier for this memory (e.g., "naming/class_suffix").
+            content: The memory content — 1-3 sentences describing the rule or decision.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("record_project_memory", {"session_id": session_id, "category": category, "key": key})
+
+        from ..core.memory import ProjectMemory
+        result = ProjectMemory(session.alarm_dir).record(category, key, content, session_id)
+        return {**result, "message": f"Memory recorded: [{category}] {key}"}
+
+    @mcp.tool()
+    def list_project_memory(category: str = "") -> dict:
+        """List all persistent project memory entries, optionally filtered by category.
+
+        Args:
+            category: Filter by category (convention | decision | antipattern | pattern).
+                      Leave empty to return all entries.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session:
+            raise ValueError("No active session. Call attach_repository first.")
+
+        from ..core.memory import ProjectMemory
+        entries = ProjectMemory(session.alarm_dir).list(category or None)
+        return {
+            "total": len(entries),
+            "category_filter": category or "all",
+            "entries": entries,
+        }
+
+    @mcp.tool()
+    def get_autopilot_policy() -> dict:
+        """Show the current autopilot auto-acceptance policy.
+
+        If no policy file exists, returns the disabled default and writes a
+        template to .alarmv3/policy/autopilot.yaml for human configuration.
+        The policy file is in the GOVERNANCE zone — only humans should edit it.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session:
+            raise ValueError("No active session. Call attach_repository first.")
+
+        from ..core.autopilot import AutopilotPolicy
+        ap = AutopilotPolicy(session.alarm_dir)
+        policy = ap.get_policy()
+        template_path = None
+        if not (session.alarm_dir / "policy" / "autopilot.yaml").exists():
+            template_path = ap.init_template()
+        return {
+            "policy": policy,
+            "policy_path": str(session.alarm_dir / "policy" / "autopilot.yaml"),
+            "template_written": template_path is not None,
+            "message": (
+                "Template written to policy_path — edit it to configure auto-acceptance rules."
+                if template_path else
+                "Policy loaded from policy_path."
+            ),
+        }
+
+    @mcp.tool()
+    def register_repo(session_id: str) -> dict:
+        """Register this session's repository in the cross-repo dependency registry.
+
+        Extracts exported public symbols and language distribution from the
+        completed analysis, then stores them in .alarmv3/crossrepo.db. Once two
+        or more repos are registered, call query_cross_repo to discover coupling.
+
+        Requires analysis to be complete (state: ANALYSIS_COMPLETE or later).
+
+        Args:
+            session_id: The session ID.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("register_repo", {"session_id": session_id})
+
+        try:
+            g.require_state_in(session.state, ANALYSIS_COMPLETE_STATES)
+            if not session.source_path:
+                raise ValueError("No source path attached to session")
+
+            from ..core.crossrepo import CrossRepoRegistry
+            registry = CrossRepoRegistry(session.alarm_dir)
+            result = registry.register(
+                session_id,
+                str(session.source_path),
+                session.artifact_dir / "analysis.db",
+            )
+            return {
+                **result,
+                "state": session.state.value,
+                "message": (
+                    f"Registered {result['exported_module_count']} exported symbols. "
+                    "Call query_cross_repo to find coupling with other registered repos."
+                ),
+            }
+        except GuardrailViolation as e:
+            g.log_error("register_repo", str(e))
+            raise
+
+    @mcp.tool()
+    def query_cross_repo(session_id: str) -> dict:
+        """Find coupling between this repo and other registered repos.
+
+        Matches this session's unresolved external module references against
+        public symbols exported by other registered repos. Returns a ranked list
+        of coupled repos with shared module names.
+
+        Requires register_repo to have been called on this session and at least
+        one other session.
+
+        Requires state: ANALYSIS_COMPLETE or later.
+
+        Args:
+            session_id: The session ID.
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("query_cross_repo", {"session_id": session_id})
+
+        try:
+            g.require_state_in(session.state, ANALYSIS_COMPLETE_STATES)
+
+            from ..core.crossrepo import CrossRepoRegistry
+            registry = CrossRepoRegistry(session.alarm_dir)
+            coupling = registry.find_coupling(
+                session_id, session.artifact_dir / "analysis.db"
+            )
+            registered = registry.list_registered()
+            return {
+                "session_id": session_id,
+                "state": session.state.value,
+                "registered_repos": len(registered),
+                "coupled_repos": len(coupling),
+                "coupling": coupling,
+                "message": (
+                    f"Found {len(coupling)} coupled repo(s) across {len(registered)} registered. "
+                    "Coupling is ordered by shared module count (highest first)."
+                ) if coupling else (
+                    f"No coupling found across {len(registered)} registered repo(s). "
+                    "Register more repos or check that analysis is complete."
+                ),
+            }
+        except GuardrailViolation as e:
+            g.log_error("query_cross_repo", str(e))
+            raise

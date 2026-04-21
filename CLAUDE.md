@@ -77,8 +77,8 @@ UNATTACHED
 
 ## LLM boundary (board decision — do not violate)
 
-`synthesis.py` calls Claude. Nothing else calls Claude. The LLM receives the
-**semantic graph** (SQLite query results), not raw source files.
+`synthesis.py` and `implementation.py` call Claude. Nothing else calls Claude.
+The LLM receives the **semantic graph** (SQLite query results), not raw source files.
 
 ```
 deterministic: file discovery, AST parsing, dependency graph, complexity metrics, chunking
@@ -105,6 +105,10 @@ parsers silently degrade; they never block startup.
 .alarmv3/                    ← gitignored
 ├── session.db               # Session state + work queue (SQLite WAL)
 ├── config.yaml              # User config
+├── memory.db                # Phase 5: cross-session project memory (conventions, decisions)
+├── crossrepo.db             # Phase 5: cross-repo dependency registry
+├── policy/
+│   └── autopilot.yaml       # Phase 5: auto-acceptance rules (GOVERNANCE — human-written)
 └── sessions/<uuid>/
     ├── analysis.db          # Manifest, symbols, graph, chunks, recommendations
     └── audit.log            # WORM append-only log (never truncate this)
@@ -137,12 +141,48 @@ parsers silently degrade; they never block startup.
 }
 ```
 
+## Phase 5: architecture
+
+### New core modules
+
+| Module | Purpose |
+|--------|---------|
+| `core/memory.py` | `ProjectMemory` — `.alarmv3/memory.db`, cross-session conventions/decisions/anti-patterns. Injected into synthesis and planner prompts. |
+| `core/autopilot.py` | `AutopilotPolicy` — reads `.alarmv3/policy/autopilot.yaml` (GOVERNANCE). `should_auto_accept(category, risk_level, effort)` gates auto-commit. Every auto-accept is audit-logged. |
+| `core/crossrepo.py` | `CrossRepoRegistry` — `.alarmv3/crossrepo.db`. Register repos, match external deps against other repos' exported symbols. |
+
+### New MCP tools (Phase 5)
+
+| Tool | State gate | Purpose |
+|------|-----------|---------|
+| `implement_batch` | WORKING_REPO_READY | Parallel plan/build/eval using ThreadPoolExecutor; groups independent items |
+| `record_project_memory` | any | Write a convention/decision/antipattern/pattern to persistent memory |
+| `list_project_memory` | any | List all memory entries, optionally filtered by category |
+| `get_autopilot_policy` | any | Show policy; writes template if absent |
+| `register_repo` | ANALYSIS_COMPLETE+ | Register this repo's exported symbols in cross-repo registry |
+| `query_cross_repo` | ANALYSIS_COMPLETE+ | Find coupled repos by matching external deps against registry |
+
+### Parallel batch design (`implement_batch`)
+
+Items are partitioned into batches by file overlap: items with no shared `affected_files`
+run concurrently in the same batch; items that share files are serialised into the next
+batch. Within each batch a `ThreadPoolExecutor` runs the full plan→build→eval pipeline
+per item. Autopilot auto-accepts eligible results without a human gate.
+
+### Autopilot safety invariants
+
+1. Disabled by default — the policy file must explicitly set `enabled: true`.
+2. Only `approve` or `flag` evaluator verdicts qualify; `reject` always requires human review.
+3. Every auto-acceptance is written to the WORM audit log (`AUTOPILOT_ACCEPT` event).
+4. The policy file lives in the GOVERNANCE zone — the engine reads it, never writes the rules.
+
 ## Phase roadmap
 
 | Phase | Scope | Key deliverable |
 |-------|-------|----------------|
-| 1 (current) | Attach → Map → Analyze → Recommend | Working MCP + CLI, 6 languages |
+| 1 | Attach → Map → Analyze → Recommend | Working MCP + CLI, 6 languages |
 | 2 | sqlite-vec RAG, query_codebase tool | Natural language Q&A over codebase |
 | 3 | Risk-weighted priority, AAA integration | Effort estimates, persona recommendations |
 | 4 | Implementation mode | Adversarial Dev pattern, separate cloned dir |
-| 5 | Continuous mode, SharePoint sync | Re-run on commit, team features |
+| 5 (current) | Persistent memory, autopilot, parallel batch, cross-repo | Enterprise-scale modernization |
+| 6 | Continuous mode, SharePoint sync | Re-run on commit, team features |

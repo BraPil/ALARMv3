@@ -70,6 +70,11 @@ class Session:
         return Path(self._row()["artifact_dir"])
 
     @property
+    def alarm_dir(self) -> Path:
+        """Workspace-level .alarmv3/ directory (parent of sessions/)."""
+        return self.artifact_dir.parent.parent
+
+    @property
     def guardrails(self) -> GuardrailsManager:
         return GuardrailsManager(self.artifact_dir)
 

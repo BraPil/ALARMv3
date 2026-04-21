@@ -9,8 +9,14 @@ Three Claude calls per change (board decision — Cole Medin Adversarial Dev pat
 
 Context discipline (Vasilev + Cole Medin): each call loads only the affected files
 from TARGET. Never loads the full repo. Prior rejection feedback is injected on retry.
+
+Phase 5 additions:
+- Project memory injected into planner/builder prompts
+- Autopilot auto-acceptance for low-risk changes (policy-gated)
+- run_batch() for parallel execution of independent plan items
 """
 
+import concurrent.futures
 import json
 import shutil
 import sqlite3
@@ -198,7 +204,7 @@ class ImplementationRunner:
 
         change_id = self._store_change(item["id"], diff, evaluation)
 
-        return {
+        result = {
             "plan_item_id": item["id"],
             "change_id": change_id,
             "rec_rank": item["rec_rank"],
@@ -207,14 +213,38 @@ class ImplementationRunner:
             "eval_verdict": evaluation.get("verdict", "pending"),
             "eval_critique": evaluation.get("critique", ""),
             "eval_risk_level": evaluation.get("risk_level"),
-            "message": (
+            "auto_accepted": False,
+        }
+
+        # Phase 5: check autopilot policy — auto-commit if change meets threshold
+        from .autopilot import AutopilotPolicy
+        policy = AutopilotPolicy(self._session.alarm_dir)
+        auto_ok, auto_reason = policy.should_auto_accept(
+            rec.get("category", ""),
+            evaluation.get("risk_level"),
+            rec.get("effort"),
+        )
+        if auto_ok and evaluation.get("verdict") in ("approve", "flag"):
+            accept_result = self.accept_change(change_id, _auto_reason=auto_reason)
+            result.update({
+                "auto_accepted": True,
+                "auto_accept_reason": auto_reason,
+                "commit_hash": accept_result.get("commit_hash"),
+                "message": (
+                    f"Auto-accepted (autopilot): {item['title']}. "
+                    f"Rule: {auto_reason}. Commit: {accept_result.get('commit_hash', 'n/a')}."
+                ),
+            })
+        else:
+            result["message"] = (
                 f"Change generated for: {item['title']}. "
                 f"Evaluator verdict: {evaluation.get('verdict')}. "
                 "Call accept_change or reject_change."
-            ),
-        }
+            )
 
-    def accept_change(self, change_id: int) -> dict:
+        return result
+
+    def accept_change(self, change_id: int, _auto_reason: "str | None" = None) -> dict:
         """Apply the accepted diff to TARGET files and git-commit the result."""
         change = self._load_change(change_id)
         if not change:
@@ -236,14 +266,15 @@ class ImplementationRunner:
                 message=f"ALARMv3: {self._load_plan_item_title(change['plan_item_id'])}",
             )
 
+        review_status = "auto_accepted" if _auto_reason else "accepted"
         now = time.time()
         conn = sqlite3.connect(self._db_path, timeout=10)
         conn.execute("PRAGMA journal_mode=WAL")
         try:
             conn.execute(
-                "UPDATE implementation_change SET review_status='accepted', "
+                "UPDATE implementation_change SET review_status=?, "
                 "commit_hash=?, reviewed_at=? WHERE id=?",
-                (commit_hash, now, change_id),
+                (review_status, commit_hash, now, change_id),
             )
             conn.execute(
                 "UPDATE implementation_plan SET status='complete' WHERE id=?",
@@ -253,10 +284,16 @@ class ImplementationRunner:
         finally:
             conn.close()
 
+        if _auto_reason:
+            self._session.guardrails._audit(
+                f"AUTOPILOT_ACCEPT change_id={change_id}",
+                {"auto_reason": _auto_reason, "commit_hash": commit_hash},
+            )
+
         return {
             "change_id": change_id,
             "commit_hash": commit_hash,
-            "status": "accepted",
+            "status": review_status,
             "message": f"Change applied and committed. Hash: {commit_hash or 'n/a (empty diff)'}",
         }
 
@@ -411,6 +448,113 @@ class ImplementationRunner:
         finally:
             conn.close()
 
+    # ── Parallel batch (Phase 5) ───────────────────────────────────────────
+
+    def run_batch(self, max_concurrent: int = 3) -> list[dict]:
+        """Run plan/build/eval for all pending items, parallelising independent ones.
+
+        Items whose affected_files sets do not overlap are dispatched concurrently.
+        Items that share files are serialised to avoid conflicting patches.
+        Returns a list of results in completion order — callers review and call
+        accept_change / reject_change on each.
+        """
+        pending = self._get_all_pending()
+        if not pending:
+            return [{"status": "no_pending_items", "message": "All plan items are complete."}]
+
+        batches = _batch_independent(pending, max_concurrent)
+        all_results: list[dict] = []
+        for batch in batches:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {executor.submit(self._run_item, item): item for item in batch}
+                for future in concurrent.futures.as_completed(futures):
+                    item = futures[future]
+                    try:
+                        all_results.append(future.result())
+                    except Exception as exc:
+                        all_results.append({
+                            "plan_item_id": item["id"],
+                            "title": item["title"],
+                            "status": "error",
+                            "error": str(exc),
+                        })
+        return all_results
+
+    def _get_all_pending(self) -> list[dict]:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT id, rec_rank, title, affected_files FROM implementation_plan "
+                "WHERE session_id=? AND status='pending' ORDER BY order_index",
+                (self._session.session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["affected_files"] = json.loads(d["affected_files"])
+            result.append(d)
+        return result
+
+    def _run_item(self, item: dict) -> dict:
+        """Run plan/build/eval for a single item dict (used by run_batch threads)."""
+        self._set_item_status(item["id"], "in_progress")
+        target = self.target_path
+        if not target or not target.exists():
+            raise ValueError(f"Target directory not found: {target}")
+        prior_feedback = self._get_prior_feedback(item["id"])
+        file_contents = _load_file_contents(item["affected_files"], target)
+        rec = self._load_recommendation(item["rec_rank"])
+        try:
+            plan = self._call_planner(rec, file_contents, prior_feedback)
+            diff = self._call_builder(rec, plan, file_contents)
+            evaluation = self._call_evaluator(rec, diff, file_contents)
+        except Exception as exc:
+            self._set_item_status(item["id"], "pending")
+            raise RuntimeError(f"Pipeline failed for item {item['id']}: {exc}") from exc
+
+        change_id = self._store_change(item["id"], diff, evaluation)
+
+        result = {
+            "plan_item_id": item["id"],
+            "change_id": change_id,
+            "rec_rank": item["rec_rank"],
+            "title": item["title"],
+            "diff": diff,
+            "eval_verdict": evaluation.get("verdict", "pending"),
+            "eval_critique": evaluation.get("critique", ""),
+            "eval_risk_level": evaluation.get("risk_level"),
+            "auto_accepted": False,
+        }
+
+        from .autopilot import AutopilotPolicy
+        policy = AutopilotPolicy(self._session.alarm_dir)
+        auto_ok, auto_reason = policy.should_auto_accept(
+            rec.get("category", ""),
+            evaluation.get("risk_level"),
+            rec.get("effort"),
+        )
+        if auto_ok and evaluation.get("verdict") in ("approve", "flag"):
+            accept_result = self.accept_change(change_id, _auto_reason=auto_reason)
+            result.update({
+                "auto_accepted": True,
+                "auto_accept_reason": auto_reason,
+                "commit_hash": accept_result.get("commit_hash"),
+                "message": (
+                    f"Auto-accepted (autopilot): {item['title']}. "
+                    f"Rule: {auto_reason}. Commit: {accept_result.get('commit_hash', 'n/a')}."
+                ),
+            })
+        else:
+            result["message"] = (
+                f"Change generated for: {item['title']}. "
+                f"Evaluator verdict: {evaluation.get('verdict')}. "
+                "Call accept_change or reject_change."
+            )
+        return result
+
     # ── LLM calls ─────────────────────────────────────────────────────────
 
     def _call_planner(self, rec: dict, files: dict[str, str], feedback: str | None) -> dict:
@@ -419,10 +563,16 @@ class ImplementationRunner:
         if feedback:
             content += f"\n\n## Prior attempt feedback\n\n{feedback}"
 
+        from .memory import ProjectMemory
+        memory_text = ProjectMemory(self._session.alarm_dir).format_for_prompt()
+        system_text = _PLANNER_PROMPT
+        if memory_text:
+            system_text = system_text + "\n\n" + memory_text
+
         msg = client.messages.create(
             model=_MODEL,
             max_tokens=1024,
-            system=[{"type": "text", "text": _PLANNER_PROMPT,
+            system=[{"type": "text", "text": system_text,
                      "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": content}],
         )
@@ -491,6 +641,30 @@ def _git_init_if_needed(path: Path) -> None:
             ["git", "commit", "-m", "ALARMv3: initial snapshot from source"],
             cwd=path, capture_output=True, check=False,
         )
+
+
+def _batch_independent(items: list[dict], max_concurrent: int) -> list[list[dict]]:
+    """Partition plan items into batches where no two items in the same batch share files.
+
+    Items with shared affected_files are serialised into separate batches so their
+    diffs do not conflict. Within each batch, all items can run in parallel.
+    """
+    batches: list[list[dict]] = []
+    remaining = list(items)
+    while remaining:
+        batch: list[dict] = []
+        used_files: set[str] = set()
+        deferred: list[dict] = []
+        for item in remaining:
+            item_files = set(item.get("affected_files", []))
+            if not (item_files & used_files) and len(batch) < max_concurrent:
+                batch.append(item)
+                used_files |= item_files
+            else:
+                deferred.append(item)
+        batches.append(batch)
+        remaining = deferred
+    return batches
 
 
 def _order_by_dependency(recs: list[dict]) -> list[dict]:
