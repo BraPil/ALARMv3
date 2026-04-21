@@ -161,9 +161,53 @@ CREATE INDEX IF NOT EXISTS idx_impl_change_review
     ON implementation_change(session_id, review_status);
 """
 
+_SUBSYSTEM = """
+CREATE TABLE IF NOT EXISTS subsystem (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT    NOT NULL,
+    subsystem_index  INTEGER NOT NULL,
+    name             TEXT    NOT NULL,
+    file_count       INTEGER NOT NULL,
+    total_loc        REAL,
+    avg_complexity   REAL,
+    files            TEXT    NOT NULL DEFAULT '[]',
+    created_at       REAL    NOT NULL,
+    UNIQUE(session_id, subsystem_index)
+);
+CREATE INDEX IF NOT EXISTS idx_subsystem_session
+    ON subsystem(session_id);
+"""
+
+_SUBSYSTEM_FINDING = """
+CREATE TABLE IF NOT EXISTS subsystem_finding (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT    NOT NULL,
+    subsystem_index  INTEGER,
+    pass_type        TEXT    NOT NULL,   -- subsystem | complexity_tier | aggregation
+    findings_json    TEXT    NOT NULL,
+    created_at       REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sf_session
+    ON subsystem_finding(session_id, pass_type);
+"""
+
+_ANALYSIS_COVERAGE = """
+CREATE TABLE IF NOT EXISTS analysis_coverage (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT    NOT NULL,
+    file_path   TEXT    NOT NULL,
+    pass_type   TEXT    NOT NULL,
+    covered_at  REAL    NOT NULL,
+    UNIQUE(session_id, file_path, pass_type)
+);
+CREATE INDEX IF NOT EXISTS idx_coverage_session
+    ON analysis_coverage(session_id);
+"""
+
 _ALL_SCHEMAS = [
     _MANIFEST, _DEPENDENCY, _SYMBOL, _COMPLEXITY, _CHUNK,
     _RECOMMENDATION, _IMPLEMENTATION_PLAN, _IMPLEMENTATION_CHANGE,
+    _SUBSYSTEM, _SUBSYSTEM_FINDING, _ANALYSIS_COVERAGE,
 ]
 
 

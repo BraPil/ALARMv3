@@ -57,6 +57,24 @@ class Orchestrator:
         thread.start()
         return job_id
 
+    def start_deep_analysis(
+        self,
+        max_subsystems: int = 15,
+        cyclomatic_threshold: int = 10,
+        coupling_threshold: int = 10,
+        aaa_grounding: "str | None" = None,
+    ) -> str:
+        """Start exhaustive multi-pass deep analysis in a background thread. Returns job_id."""
+        job_id = self._new_job("deep_analysis")
+        thread = threading.Thread(
+            target=self._run_deep_analysis,
+            args=(job_id, max_subsystems, cyclomatic_threshold, coupling_threshold, aaa_grounding),
+            daemon=True,
+            name=f"alarmv3-deep-{job_id[:8]}",
+        )
+        thread.start()
+        return job_id
+
     def synthesize_recommendations(self, aaa_grounding: "str | None" = None) -> dict:
         """Run synthesis then adversarial evaluation. Returns combined result dict."""
         from .evaluation import RecommendationEvaluator
@@ -105,6 +123,41 @@ class Orchestrator:
             ) as pool:
                 total = scanner.scan(pool, job_id)
             self._finish_job(job_id, files_discovered=total)
+        except Exception as e:
+            self._fail_job(job_id, str(e))
+
+    def _run_deep_analysis(
+        self,
+        job_id: str,
+        max_subsystems: int,
+        cyclomatic_threshold: int,
+        coupling_threshold: int,
+        aaa_grounding: "str | None",
+    ) -> None:
+        try:
+            from .deep_analysis import DeepSynthesizer
+
+            def _progress(pct: int, msg: str) -> None:
+                with self._lock:
+                    self._jobs[job_id]["progress"] = pct
+                    self._jobs[job_id]["status_message"] = msg
+
+            result = DeepSynthesizer(self._session, progress_cb=_progress).run(
+                max_subsystems=max_subsystems,
+                cyclomatic_threshold=cyclomatic_threshold,
+                coupling_threshold=coupling_threshold,
+                aaa_grounding=aaa_grounding,
+            )
+            self._finish_job(
+                job_id,
+                recommendation_count=result["recommendation_count"],
+                subsystem_count=result["subsystem_count"],
+                files_covered=result["files_covered"],
+                coverage_pct=result["coverage_pct"],
+                outlier_files_analyzed=result["outlier_files_analyzed"],
+                raw_findings_count=result["raw_findings_count"],
+                evaluator_summary=result["evaluator_summary"],
+            )
         except Exception as e:
             self._fail_job(job_id, str(e))
 
