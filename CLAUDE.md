@@ -176,6 +176,49 @@ per item. Autopilot auto-accepts eligible results without a human gate.
 3. Every auto-acceptance is written to the WORM audit log (`AUTOPILOT_ACCEPT` event).
 4. The policy file lives in the GOVERNANCE zone — the engine reads it, never writes the rules.
 
+## Phase 6: deep analysis engine
+
+`core/deep_analysis.py` — exhaustive multi-pass synthesis replacing the single statistical digest.
+
+### Architecture
+
+```
+SubsystemPartitioner
+  └─ union-find on dependency_edge graph
+  └─ every eligible file lands in exactly one subsystem
+  └─ excess clusters merged into a 'remaining' bucket (max_subsystems cap)
+
+DeepSynthesizer — four phases:
+  A. partition    → subsystem table
+  B. per-subsystem Claude calls → subsystem_finding (all symbols + edges per cluster)
+  C. complexity-tier pass       → subsystem_finding (outlier files: cyclomatic/coupling threshold)
+  D. aggregation pass           → recommendation table (deduplication + ranking)
+  + adversarial evaluator (reused from Phase 3)
+```
+
+### Coverage guarantee
+
+Every eligible file is assigned to exactly one subsystem by union-find. Coverage is tracked
+in `analysis_coverage` per file per pass. The `run_deep_analysis` tool reports `coverage_pct`
+so gaps are visible, not silent.
+
+### New MCP tool
+
+| Tool | State gate | Purpose |
+|------|-----------|---------|
+| `run_deep_analysis` | ANALYSIS_IN_PROGRESS | Background multi-pass synthesis; returns job_id |
+
+Parameters: `max_subsystems` (default 15, max 30), `cyclomatic_threshold` (default 10),
+`coupling_threshold` (default 10). After completion, same review flow as `generate_recommendations`.
+
+### New DB tables (analysis.db per session)
+
+| Table | Purpose |
+|-------|---------|
+| `subsystem` | Cluster metadata: name, file list, LOC, avg complexity |
+| `subsystem_finding` | Raw Claude findings per pass before aggregation |
+| `analysis_coverage` | Per-file coverage tracking across pass types |
+
 ## Phase roadmap
 
 | Phase | Scope | Key deliverable |
@@ -184,5 +227,6 @@ per item. Autopilot auto-accepts eligible results without a human gate.
 | 2 | sqlite-vec RAG, query_codebase tool | Natural language Q&A over codebase |
 | 3 | Risk-weighted priority, AAA integration | Effort estimates, persona recommendations |
 | 4 | Implementation mode | Adversarial Dev pattern, separate cloned dir |
-| 5 (current) | Persistent memory, autopilot, parallel batch, cross-repo | Enterprise-scale modernization |
-| 6 | Continuous mode, SharePoint sync | Re-run on commit, team features |
+| 5 | Persistent memory, autopilot, parallel batch, cross-repo | Enterprise-scale modernization |
+| 6 (current) | Deep analysis engine | Exhaustive subsystem-partitioned multi-pass synthesis |
+| 7 | Continuous mode, SharePoint sync | Re-run on commit, team features |

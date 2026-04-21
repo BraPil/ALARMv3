@@ -39,6 +39,8 @@ EXPECTED_TOOLS = {
     "get_autopilot_policy",
     "register_repo",
     "query_cross_repo",
+    # Phase 6
+    "run_deep_analysis",
 }
 
 

@@ -592,6 +592,95 @@ def register_tools(mcp: FastMCP) -> None:
             g.log_error("reject_change", str(e))
             raise
 
+    # ── Phase 6 tools ──────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def run_deep_analysis(
+        session_id: str,
+        max_subsystems: int = 15,
+        cyclomatic_threshold: int = 10,
+        coupling_threshold: int = 10,
+    ) -> dict:
+        """Run exhaustive multi-pass LLM synthesis over the full codebase semantic graph.
+
+        A more thorough alternative to generate_recommendations. Instead of a single
+        pass over a statistical digest, this runs:
+
+          1. SubsystemPartitioner — union-find clustering of the dependency graph
+             into coherent architectural subsystems (every file gets covered)
+          2. Per-subsystem passes — one Claude call per cluster with all symbols,
+             all internal dependency edges, and all complexity metrics for that cluster
+          3. Complexity-tier deep pass — focused analysis of files whose cyclomatic
+             complexity or fan-in/fan-out exceeds the threshold
+          4. Aggregation pass — deduplication, cross-subsystem promotion, final ranking
+          5. Adversarial evaluator — same evaluator as generate_recommendations
+
+        Runs in the background. Poll get_job_status(job_id) until status='complete',
+        then call review_recommendations as normal.
+
+        Cost note: N subsystems × ~1 Claude call each + 2 shared passes. Estimated
+        10–30 Claude calls for a typical codebase.
+
+        Requires state: ANALYSIS_IN_PROGRESS.
+
+        Args:
+            session_id: The session ID.
+            max_subsystems: Maximum subsystem passes to run (default 15, max 30).
+                            Smaller clusters are merged into a 'remaining' bucket.
+            cyclomatic_threshold: Files with cyclomatic complexity >= this get the
+                                  complexity-tier deep pass (default 10).
+            coupling_threshold: Files with combined fan-in+fan-out >= this also get
+                                the complexity-tier pass (default 10).
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("run_deep_analysis", {
+            "session_id": session_id,
+            "max_subsystems": max_subsystems,
+            "cyclomatic_threshold": cyclomatic_threshold,
+            "coupling_threshold": coupling_threshold,
+        })
+
+        try:
+            g.require_state(session.state, SessionState.ANALYSIS_IN_PROGRESS)
+            max_subsystems = min(max(1, max_subsystems), 30)
+
+            aaa_grounding = _try_aaa_grounding(
+                f"Legacy codebase at {session.source_path}: "
+                "exhaustive modernization analysis across all subsystems"
+            )
+            if aaa_grounding:
+                g.log_tool_call("aaa_grounding_fetched", {"chars": len(aaa_grounding)})
+
+            from ..core.orchestration import Orchestrator
+            job_id = Orchestrator(session).start_deep_analysis(
+                max_subsystems=max_subsystems,
+                cyclomatic_threshold=cyclomatic_threshold,
+                coupling_threshold=coupling_threshold,
+                aaa_grounding=aaa_grounding,
+            )
+            session.transition_to(SessionState.RECOMMENDATIONS_PENDING_REVIEW)
+
+            return {
+                "session_id": session_id,
+                "job_id": job_id,
+                "state": session.state.value,
+                "max_subsystems": max_subsystems,
+                "cyclomatic_threshold": cyclomatic_threshold,
+                "coupling_threshold": coupling_threshold,
+                "next_step": (
+                    f"Poll get_job_status('{job_id}') until status='complete'. "
+                    "Then review at recommendations://evaluated and call review_recommendations."
+                ),
+            }
+        except GuardrailViolation as e:
+            g.log_error("run_deep_analysis", str(e))
+            raise
+
     # ── Phase 5 tools ──────────────────────────────────────────────────────
 
     @mcp.tool()

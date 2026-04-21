@@ -1,0 +1,651 @@
+"""Deep analysis engine — exhaustive multi-pass LLM synthesis over the full semantic graph.
+
+Board decision (Phase 6). Replaces the single-pass statistical digest in synthesis.py
+with a three-phase pipeline that achieves full codebase coverage:
+
+  Phase A — SubsystemPartitioner
+      Union-find clustering on dependency_edge graph → coherent architectural subsystems.
+      Every file lands in exactly one subsystem.
+
+  Phase B — Per-subsystem synthesis passes
+      One Claude call per cluster. Each call receives all symbols, all internal dependency
+      edges, and all complexity metrics for that subsystem. Bounded by max_symbols_per_pass
+      to stay within context limits.
+
+  Phase C — Complexity-tier deep pass
+      Files whose cyclomatic complexity OR fan-in/fan-out exceeds threshold get a dedicated
+      focused pass regardless of subsystem membership.
+
+  Phase D — Aggregation pass
+      All subsystem findings + complexity findings fed to a final Claude call that
+      deduplicates, merges related items, and produces the ranked recommendation list.
+      Result is stored in the existing recommendation table — all downstream tools unchanged.
+
+Coverage is tracked in analysis_coverage so nothing is silently skipped.
+The final recommendations run through the existing adversarial evaluator.
+"""
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+import anthropic
+
+from .session import Session
+
+_MODEL = "claude-sonnet-4-6"
+_MAX_TOKENS_SUBSYSTEM = 2048
+_MAX_TOKENS_COMPLEXITY = 2048
+_MAX_TOKENS_AGGREGATION = 4096
+_MAX_SYMBOLS_PER_PASS = 150   # cap per subsystem to stay within context
+_MAX_EDGES_PER_PASS = 200
+
+
+# ── Prompts ────────────────────────────────────────────────────────────────────
+
+_SUBSYSTEM_PROMPT = """\
+You are a senior software architect analyzing one subsystem of a legacy codebase.
+
+You receive the dependency graph, symbol table, and complexity metrics for a specific
+cluster of files that are strongly coupled to each other. Identify all modernization
+issues in this subsystem.
+
+Focus on:
+1. God objects / files with excessive responsibility (high symbol count, high LOC)
+2. Architectural violations — circular dependencies, layer leaks, cross-cutting concerns
+3. Security issues visible in the symbol/dependency structure (dangerous patterns, missing abstractions)
+4. Quality debt — missing interfaces, poor cohesion, fragile coupling
+5. Opportunities — natural seams for extraction, common abstractions across files
+
+Return ONLY a valid JSON array of findings:
+[{
+  "category": "security|modernization|quality|dependency",
+  "severity": "critical|high|medium|low",
+  "title": "short title under 80 chars",
+  "description": "2-4 sentences: what is wrong, why it matters, what the fix looks like",
+  "affected_files": ["relative/path"],
+  "effort": "S|M|L|XL",
+  "rationale": "one sentence on why this matters now"
+}]
+
+Up to 10 findings. If the subsystem is clean, return [].
+No text outside the JSON array.\
+"""
+
+_COMPLEXITY_TIER_PROMPT = """\
+You are a software architect doing a focused deep review of the highest-complexity files
+in a legacy codebase.
+
+These files have been flagged for elevated cyclomatic complexity or extreme fan-in/fan-out.
+High complexity + high coupling = highest blast radius during modernization.
+
+For each file, identify:
+1. Decomposition opportunities — what single responsibility violations exist
+2. Hidden coupling — what this file knows about that it shouldn't
+3. Testability problems caused by the complexity
+4. Refactoring risk — who depends on this, what breaks if it changes
+
+Return ONLY a valid JSON array (same schema as above). Up to 15 findings. No text outside the array.\
+"""
+
+_AGGREGATION_PROMPT = """\
+You are a senior software architect consolidating findings from multiple analysis passes
+of a legacy codebase into a final prioritized modernization plan.
+
+You receive a JSON object with findings from N subsystem passes and a complexity-tier pass.
+Produce a single deduplicated, ranked recommendation list.
+
+Rules:
+- Merge duplicate findings (same file + same issue type → one item)
+- Promote findings that appear across multiple subsystems — cross-cutting issues rank higher
+- Rank by: severity (critical first), then cross-subsystem impact, then effort (S before XL)
+- Maximum 20 final recommendations
+- Add a "rank" integer field (1 = highest priority)
+- Preserve all original fields; if merging, union the affected_files lists
+
+Return ONLY a valid JSON array ordered by rank (1 first). No text outside the array.\
+"""
+
+
+# ── Partitioner ────────────────────────────────────────────────────────────────
+
+class SubsystemPartitioner:
+    """Clusters files into subsystems using union-find on the dependency_edge graph."""
+
+    def __init__(self, session: Session):
+        self._session = session
+        self._db_path = session.artifact_dir / "analysis.db"
+
+    def partition(self, min_cluster_size: int = 2, max_subsystems: int = 15) -> list[dict]:
+        """Return a list of subsystem dicts covering every eligible file.
+
+        Clusters are ordered by (file_count × avg_complexity) descending so the most
+        architecturally significant subsystems are processed first.
+
+        If the number of natural clusters exceeds max_subsystems, the smallest clusters
+        are merged into a final "remaining" bucket so every file is still covered.
+        """
+        files, edges = self._load_graph()
+        if not files:
+            return []
+
+        components = _union_find(files, edges)
+        clusters = sorted(components.values(), key=lambda c: -len(c))
+
+        # Separate large clusters from singletons
+        significant = [c for c in clusters if len(c) >= min_cluster_size]
+        singletons = [f for c in clusters if len(c) < min_cluster_size for f in c]
+
+        # Enforce max_subsystems: merge excess clusters into a "remaining" bucket
+        if len(significant) > max_subsystems - 1:
+            overflow = [f for c in significant[max_subsystems - 1:] for f in c]
+            significant = significant[:max_subsystems - 1]
+            singletons = singletons + overflow
+
+        subsystems = []
+        for idx, cluster in enumerate(significant):
+            stats = self._compute_stats(cluster)
+            subsystems.append({
+                "index": idx,
+                "name": _derive_name(cluster, idx),
+                "files": cluster,
+                **stats,
+            })
+
+        if singletons:
+            stats = self._compute_stats(singletons)
+            subsystems.append({
+                "index": len(subsystems),
+                "name": "remaining",
+                "files": singletons,
+                **stats,
+            })
+
+        # Order by importance: file_count × avg_complexity
+        subsystems.sort(key=lambda s: -(s["file_count"] * max(s["avg_complexity"], 1.0)))
+        return subsystems
+
+    def get_complexity_outliers(self, cyclomatic_threshold: int = 10, coupling_threshold: int = 10) -> list[str]:
+        """Return files whose cyclomatic complexity or fan-in+fan-out exceeds the threshold."""
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        sid = self._session.session_id
+        try:
+            high_cyclo = {
+                r["file_path"]
+                for r in conn.execute(
+                    "SELECT file_path FROM complexity_metric "
+                    "WHERE session_id=? AND metric_name='cyclomatic' AND metric_value>=?",
+                    (sid, cyclomatic_threshold),
+                ).fetchall()
+            }
+            high_coupling = {
+                r["file_path"]
+                for r in conn.execute(
+                    "SELECT file_path FROM complexity_metric "
+                    "WHERE session_id=? AND metric_name IN ('coupling_in','coupling_out') "
+                    "GROUP BY file_path HAVING SUM(metric_value)>=?",
+                    (sid, coupling_threshold),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        return sorted(high_cyclo | high_coupling)
+
+    # ── Internals ──────────────────────────────────────────────────────────
+
+    def _load_graph(self) -> tuple[list[str], list[tuple[str, str]]]:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        sid = self._session.session_id
+        try:
+            files = [
+                r["relative_path"]
+                for r in conn.execute(
+                    "SELECT relative_path FROM manifest WHERE session_id=? AND is_eligible=1",
+                    (sid,),
+                ).fetchall()
+            ]
+            edges = [
+                (r["source_file"], r["target_file"])
+                for r in conn.execute(
+                    "SELECT source_file, target_file FROM dependency_edge "
+                    "WHERE session_id=? AND target_file IS NOT NULL",
+                    (sid,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        return files, edges
+
+    def _compute_stats(self, files: list[str]) -> dict:
+        if not files:
+            return {"file_count": 0, "total_loc": 0, "avg_complexity": 0.0}
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        sid = self._session.session_id
+        placeholders = ",".join("?" * len(files))
+        try:
+            loc_row = conn.execute(
+                f"SELECT SUM(metric_value) FROM complexity_metric "
+                f"WHERE session_id=? AND metric_name='loc' AND file_path IN ({placeholders})",
+                [sid, *files],
+            ).fetchone()
+            cyc_row = conn.execute(
+                f"SELECT AVG(metric_value) FROM complexity_metric "
+                f"WHERE session_id=? AND metric_name='cyclomatic' AND file_path IN ({placeholders})",
+                [sid, *files],
+            ).fetchone()
+        finally:
+            conn.close()
+        return {
+            "file_count": len(files),
+            "total_loc": int(loc_row[0] or 0),
+            "avg_complexity": round(float(cyc_row[0] or 0), 2),
+        }
+
+
+# ── Synthesizer ────────────────────────────────────────────────────────────────
+
+class DeepSynthesizer:
+    """Runs the four-phase deep synthesis pipeline and stores results."""
+
+    def __init__(self, session: Session, progress_cb: Optional[Callable[[int, str], None]] = None):
+        self._session = session
+        self._db_path = session.artifact_dir / "analysis.db"
+        self._progress = progress_cb or (lambda pct, msg: None)
+
+    def run(
+        self,
+        max_subsystems: int = 15,
+        cyclomatic_threshold: int = 10,
+        coupling_threshold: int = 10,
+        aaa_grounding: Optional[str] = None,
+    ) -> dict:
+        """Execute full deep analysis pipeline. Returns result dict (same shape as Synthesizer.run)."""
+        partitioner = SubsystemPartitioner(self._session)
+
+        # Phase A — partition
+        self._progress(5, "Partitioning dependency graph into subsystems…")
+        subsystems = partitioner.partition(max_subsystems=max_subsystems)
+        outlier_files = partitioner.get_complexity_outliers(cyclomatic_threshold, coupling_threshold)
+
+        self._store_subsystems(subsystems)
+        total_files_covered = sum(s["file_count"] for s in subsystems)
+
+        # Phase B — per-subsystem passes
+        all_findings: list[dict] = []
+        for idx, subsystem in enumerate(subsystems):
+            pct = 10 + int((idx / max(len(subsystems), 1)) * 55)
+            self._progress(pct, f"Analyzing subsystem {idx + 1}/{len(subsystems)}: {subsystem['name']}…")
+            context = _build_subsystem_context(self._session.session_id, subsystem, self._db_path)
+            findings = self._call_subsystem(context, subsystem["name"])
+            self._store_finding(subsystem["index"], "subsystem", findings)
+            self._mark_coverage(subsystem["files"], "subsystem")
+            all_findings.extend(findings)
+
+        # Phase C — complexity-tier deep pass
+        self._progress(70, f"Complexity-tier pass: {len(outlier_files)} outlier files…")
+        if outlier_files:
+            complexity_context = _build_complexity_context(
+                self._session.session_id, outlier_files, self._db_path
+            )
+            complexity_findings = self._call_complexity_tier(complexity_context)
+            self._store_finding(None, "complexity_tier", complexity_findings)
+            self._mark_coverage(outlier_files, "complexity_tier")
+            all_findings.extend(complexity_findings)
+
+        # Phase D — aggregation
+        self._progress(80, "Aggregating and deduplicating findings…")
+        if aaa_grounding:
+            all_findings_with_grounding = {"findings": all_findings, "aaa_grounding": aaa_grounding}
+        else:
+            all_findings_with_grounding = {"findings": all_findings}
+
+        from .memory import ProjectMemory
+        memory_text = ProjectMemory(self._session.alarm_dir).format_for_prompt()
+
+        recommendations = self._call_aggregation(all_findings_with_grounding, memory_text)
+        self._store_recommendations(recommendations)
+
+        # Adversarial evaluation (reuse existing evaluator)
+        self._progress(90, "Running adversarial evaluator on aggregated recommendations…")
+        from .evaluation import RecommendationEvaluator
+        from .synthesis import Synthesizer
+        evaluator = RecommendationEvaluator(self._session)
+        repo_context = Synthesizer(self._session)._build_context()
+        evaluations = evaluator.evaluate(recommendations, repo_context)
+        evaluator.store_evaluations(evaluations)
+
+        self._progress(100, "Deep analysis complete.")
+
+        from .orchestration import _tally_verdicts
+        verdict_summary = _tally_verdicts(evaluations)
+
+        coverage_pct = self._coverage_percentage()
+        return {
+            "session_id": self._session.session_id,
+            "recommendation_count": len(recommendations),
+            "recommendations": recommendations,
+            "top_recommendations": recommendations[:5],
+            "subsystem_count": len(subsystems),
+            "files_covered": total_files_covered,
+            "coverage_pct": coverage_pct,
+            "outlier_files_analyzed": len(outlier_files),
+            "raw_findings_count": len(all_findings),
+            "evaluator_summary": verdict_summary,
+            "message": (
+                f"Deep analysis complete: {len(subsystems)} subsystems, "
+                f"{total_files_covered} files covered ({coverage_pct:.0f}%), "
+                f"{len(recommendations)} recommendations. "
+                f"Evaluator: {verdict_summary['accept']} accept, "
+                f"{verdict_summary['revise']} revise, "
+                f"{verdict_summary['reject']} reject. "
+                "Review at recommendations://evaluated then call review_recommendations."
+            ),
+        }
+
+    # ── LLM calls ─────────────────────────────────────────────────────────
+
+    def _call_subsystem(self, context: dict, name: str) -> list[dict]:
+        client = anthropic.Anthropic()
+        content = f"## Subsystem: {name}\n\n{json.dumps(context, indent=2)}"
+        msg = client.messages.create(
+            model=_MODEL,
+            max_tokens=_MAX_TOKENS_SUBSYSTEM,
+            system=[{"type": "text", "text": _SUBSYSTEM_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": content}],
+        )
+        return _parse_findings(msg.content[0].text)
+
+    def _call_complexity_tier(self, context: dict) -> list[dict]:
+        client = anthropic.Anthropic()
+        content = f"## Complexity outliers\n\n{json.dumps(context, indent=2)}"
+        msg = client.messages.create(
+            model=_MODEL,
+            max_tokens=_MAX_TOKENS_COMPLEXITY,
+            system=[{"type": "text", "text": _COMPLEXITY_TIER_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": content}],
+        )
+        return _parse_findings(msg.content[0].text)
+
+    def _call_aggregation(self, findings_payload: dict, memory_text: str) -> list[dict]:
+        client = anthropic.Anthropic()
+        system_text = _AGGREGATION_PROMPT
+        if memory_text:
+            system_text = system_text + "\n\n" + memory_text
+        content = f"## All findings ({len(findings_payload.get('findings', []))} items)\n\n{json.dumps(findings_payload, indent=2)}"
+        msg = client.messages.create(
+            model=_MODEL,
+            max_tokens=_MAX_TOKENS_AGGREGATION,
+            system=[{"type": "text", "text": system_text,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": content}],
+        )
+        return _parse_findings(msg.content[0].text)
+
+    # ── Storage helpers ────────────────────────────────────────────────────
+
+    def _store_subsystems(self, subsystems: list[dict]) -> None:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        now = time.time()
+        sid = self._session.session_id
+        try:
+            for s in subsystems:
+                conn.execute(
+                    "INSERT OR REPLACE INTO subsystem"
+                    "(session_id, subsystem_index, name, file_count, total_loc, avg_complexity, files, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (sid, s["index"], s["name"], s["file_count"],
+                     s["total_loc"], s["avg_complexity"],
+                     json.dumps(s["files"]), now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _store_finding(self, subsystem_index: Optional[int], pass_type: str, findings: list[dict]) -> None:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.execute(
+                "INSERT INTO subsystem_finding"
+                "(session_id, subsystem_index, pass_type, findings_json, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (self._session.session_id, subsystem_index, pass_type,
+                 json.dumps(findings), time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _mark_coverage(self, files: list[str], pass_type: str) -> None:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        now = time.time()
+        sid = self._session.session_id
+        try:
+            for f in files:
+                conn.execute(
+                    "INSERT OR IGNORE INTO analysis_coverage(session_id, file_path, pass_type, covered_at) "
+                    "VALUES (?,?,?,?)",
+                    (sid, f, pass_type, now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _store_recommendations(self, recommendations: list[dict]) -> None:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        now = time.time()
+        sid = self._session.session_id
+        try:
+            # Clear any prior recs from this session before storing deep analysis results
+            conn.execute("DELETE FROM recommendation WHERE session_id=?", (sid,))
+            for rec in recommendations:
+                conn.execute(
+                    "INSERT INTO recommendation"
+                    "(session_id, rank, category, severity, title, "
+                    " description, affected_files, effort, rationale, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        sid,
+                        rec.get("rank", 99),
+                        rec.get("category", "modernization"),
+                        rec.get("severity", "medium"),
+                        rec.get("title", ""),
+                        rec.get("description", ""),
+                        json.dumps(rec.get("affected_files", [])),
+                        rec.get("effort", "M"),
+                        rec.get("rationale", ""),
+                        now,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _coverage_percentage(self) -> float:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        sid = self._session.session_id
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM manifest WHERE session_id=? AND is_eligible=1", (sid,)
+            ).fetchone()[0]
+            covered = conn.execute(
+                "SELECT COUNT(DISTINCT file_path) FROM analysis_coverage WHERE session_id=?", (sid,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        return (covered / total * 100) if total > 0 else 0.0
+
+
+# ── Module-level helpers ───────────────────────────────────────────────────────
+
+def _union_find(files: list[str], edges: list[tuple[str, str]]) -> dict[str, list[str]]:
+    """Return connected components as {root: [file, ...]} via union-find with path compression."""
+    parent = {f: f for f in files}
+
+    def find(x: str) -> str:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(x: str, y: str) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for src, tgt in edges:
+        if src in parent and tgt in parent:
+            union(src, tgt)
+
+    components: dict[str, list[str]] = {}
+    for f in files:
+        root = find(f)
+        components.setdefault(root, []).append(f)
+    return components
+
+
+def _derive_name(files: list[str], idx: int) -> str:
+    """Derive a human-readable name from the dominant directory in the cluster."""
+    dirs: dict[str, int] = {}
+    for f in files:
+        parts = f.split("/")
+        if len(parts) > 1:
+            dirs[parts[0]] = dirs.get(parts[0], 0) + 1
+    if dirs:
+        dominant = max(dirs, key=lambda d: dirs[d])
+        return f"{dominant}_cluster"
+    return f"subsystem_{idx:03d}"
+
+
+def _build_subsystem_context(session_id: str, subsystem: dict, db_path: Path) -> dict:
+    """Build a rich context dict for one subsystem — all metrics, bounded symbols."""
+    files = subsystem["files"]
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" * len(files))
+    try:
+        symbols = [
+            {"name": r["name"], "type": r["symbol_type"], "file": r["file_path"],
+             "start_line": r["start_line"], "is_public": bool(r["is_public"])}
+            for r in conn.execute(
+                f"SELECT name, symbol_type, file_path, start_line, is_public FROM symbol "
+                f"WHERE session_id=? AND file_path IN ({placeholders}) "
+                f"ORDER BY is_public DESC LIMIT {_MAX_SYMBOLS_PER_PASS}",
+                [session_id, *files],
+            ).fetchall()
+        ]
+        internal_edges = [
+            {"from": r["source_file"], "to": r["target_file"], "type": r["dep_type"]}
+            for r in conn.execute(
+                f"SELECT source_file, target_file, dep_type FROM dependency_edge "
+                f"WHERE session_id=? AND source_file IN ({placeholders}) "
+                f"AND target_file IN ({placeholders}) LIMIT {_MAX_EDGES_PER_PASS}",
+                [session_id, *files, *files],
+            ).fetchall()
+        ]
+        cross_edges = [
+            {"from": r["source_file"], "to": r["target_module"] or r["target_file"], "type": r["dep_type"]}
+            for r in conn.execute(
+                f"SELECT source_file, target_file, target_module, dep_type FROM dependency_edge "
+                f"WHERE session_id=? AND source_file IN ({placeholders}) "
+                f"AND (target_file NOT IN ({placeholders}) OR target_file IS NULL) "
+                f"LIMIT 100",
+                [session_id, *files, *files],
+            ).fetchall()
+        ]
+        metrics = {}
+        for r in conn.execute(
+            f"SELECT file_path, metric_name, metric_value FROM complexity_metric "
+            f"WHERE session_id=? AND file_path IN ({placeholders})",
+            [session_id, *files],
+        ).fetchall():
+            metrics.setdefault(r["file_path"], {})[r["metric_name"]] = r["metric_value"]
+    finally:
+        conn.close()
+
+    return {
+        "file_count": len(files),
+        "files_with_metrics": [
+            {"file": f, "metrics": metrics.get(f, {})} for f in files
+        ],
+        "symbols": symbols,
+        "internal_dependency_edges": internal_edges,
+        "cross_boundary_edges": cross_edges,
+    }
+
+
+def _build_complexity_context(session_id: str, outlier_files: list[str], db_path: Path) -> dict:
+    """Build a deep context for complexity-tier outlier files."""
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" * len(outlier_files))
+    try:
+        all_symbols = [
+            {"name": r["name"], "type": r["symbol_type"], "file": r["file_path"],
+             "start_line": r["start_line"], "end_line": r["end_line"], "signature": r["signature"]}
+            for r in conn.execute(
+                f"SELECT name, symbol_type, file_path, start_line, end_line, signature "
+                f"FROM symbol WHERE session_id=? AND file_path IN ({placeholders})",
+                [session_id, *outlier_files],
+            ).fetchall()
+        ]
+        all_metrics = {}
+        for r in conn.execute(
+            f"SELECT file_path, metric_name, metric_value FROM complexity_metric "
+            f"WHERE session_id=? AND file_path IN ({placeholders})",
+            [session_id, *outlier_files],
+        ).fetchall():
+            all_metrics.setdefault(r["file_path"], {})[r["metric_name"]] = r["metric_value"]
+
+        callers = [
+            {"caller": r["source_file"], "callee": r["target_file"], "type": r["dep_type"]}
+            for r in conn.execute(
+                f"SELECT source_file, target_file, dep_type FROM dependency_edge "
+                f"WHERE session_id=? AND target_file IN ({placeholders}) LIMIT 200",
+                [session_id, *outlier_files],
+            ).fetchall()
+        ]
+        callees = [
+            {"caller": r["source_file"], "callee": r["target_file"], "type": r["dep_type"]}
+            for r in conn.execute(
+                f"SELECT source_file, target_file, dep_type FROM dependency_edge "
+                f"WHERE session_id=? AND source_file IN ({placeholders}) LIMIT 200",
+                [session_id, *outlier_files],
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    return {
+        "outlier_file_count": len(outlier_files),
+        "files_with_metrics": [
+            {"file": f, "metrics": all_metrics.get(f, {})} for f in outlier_files
+        ],
+        "all_symbols": all_symbols,
+        "who_calls_these_files": callers,
+        "what_these_files_call": callees,
+    }
+
+
+def _parse_findings(text: str) -> list[dict]:
+    """Extract JSON array of findings from Claude's response."""
+    start = text.find("[")
+    end = text.rfind("]") + 1
+    if start < 0 or end <= start:
+        return []
+    try:
+        result = json.loads(text[start:end])
+        return result if isinstance(result, list) else []
+    except json.JSONDecodeError:
+        return []
