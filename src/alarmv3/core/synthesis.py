@@ -17,7 +17,7 @@ import anthropic
 from .session import Session
 
 _MODEL = "claude-sonnet-4-6"
-_MAX_TOKENS = 4096
+_MAX_TOKENS = 8192
 
 _SYSTEM_PROMPT = """\
 You are a senior software architect reviewing a legacy codebase for modernization.
@@ -206,12 +206,34 @@ class Synthesizer:
 
 
 def _parse_recommendations(text: str) -> list[dict]:
-    """Extract JSON array from Claude's response."""
-    start = text.find("[")
-    end = text.rfind("]") + 1
-    if start < 0 or end <= start:
+    """Extract JSON array from Claude's response.
+
+    Handles fenced code blocks (```json ... ```) and truncation at max_tokens
+    by salvaging all complete objects before the truncation point.
+    """
+    # Strip markdown code fences
+    cleaned = text.replace("```json", "").replace("```", "").strip()
+
+    start = cleaned.find("[")
+    if start < 0:
+        return []
+
+    # Try full parse first
+    end = cleaned.rfind("]") + 1
+    if end > start:
+        try:
+            return json.loads(cleaned[start:end])
+        except json.JSONDecodeError:
+            pass
+
+    # Response was truncated — salvage all complete objects
+    fragment = cleaned[start:]
+    last_complete = fragment.rfind("},")
+    if last_complete < 0:
+        last_complete = fragment.rfind("}")
+    if last_complete < 0:
         return []
     try:
-        return json.loads(text[start:end])
+        return json.loads(fragment[: last_complete + 1] + "\n]")
     except json.JSONDecodeError:
         return []
