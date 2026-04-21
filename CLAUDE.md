@@ -26,6 +26,7 @@ src/alarmv3/
 │   ├── synthesis.py     Claude API — recommendation generation ONLY
 │   ├── knowledge.py     Chunking + Ollama embeddings + sqlite-vec (Phase 2)
 │   ├── evaluation.py    Adversarial evaluator — separate Claude call (Phase 3)
+│   ├── implementation.py Plan/build/eval pipeline + git commit to TARGET (Phase 4)
 │   ├── artifacts.py     Markdown/JSON output writers
 │   └── orchestration.py ThreadPoolExecutor harness + SQLite work queue
 ├── mcp/           Thin wrapper. Delegates ALL logic to core. No business logic here.

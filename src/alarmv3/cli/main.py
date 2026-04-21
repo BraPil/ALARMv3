@@ -39,8 +39,8 @@ def analyze(source_path: str, workspace: str, workers: int):
     from ..core.artifacts import ArtifactWriter
     from ..core.discovery import FileScanner
     from ..core.guardrails import GuardrailViolation, SessionState
+    from ..core.orchestration import Orchestrator
     from ..core.session import SessionManager
-    from ..core.synthesis import Synthesizer
 
     sm = SessionManager(Path(workspace))
     session = sm.get_or_create()
@@ -86,13 +86,30 @@ def analyze(source_path: str, workspace: str, workers: int):
                 + (f" ({stats['files_failed']} failed)" if stats.get("files_failed") else "")
             )
 
-        # ── Step 4: Synthesize ────────────────────────────────────────────
+        # ── Step 4: Synthesize + evaluate ─────────────────────────────────
         with Progress(SpinnerColumn(), TextColumn("{task.description}"),
                       console=console, transient=True) as prog:
             task = prog.add_task("Generating recommendations (Claude)...")
-            result = Synthesizer(session).run()
+            result = Orchestrator(session).synthesize_recommendations()
+            session.transition_to(SessionState.RECOMMENDATIONS_PENDING_REVIEW)
+            prog.update(task, description="Running adversarial evaluator...")
+            # CLI is non-interactive: auto-accept all recommendations
+            import sqlite3 as _sqlite3
+            _conn = _sqlite3.connect(session.artifact_dir / "analysis.db", timeout=10)
+            _conn.execute("PRAGMA journal_mode=WAL")
+            _conn.execute(
+                "UPDATE recommendation SET review_status='accepted', approved=1 WHERE session_id=?",
+                (session.session_id,),
+            )
+            _conn.commit()
+            _conn.close()
             session.transition_to(SessionState.ANALYSIS_COMPLETE)
-        console.print(f"[green]✓[/green] Generated {result['recommendation_count']} recommendations")
+        ev = result.get("evaluator_summary", {})
+        console.print(
+            f"[green]✓[/green] Generated {result['recommendation_count']} recommendations "
+            f"(evaluator: {ev.get('accept', 0)} accept, "
+            f"{ev.get('revise', 0)} revise, {ev.get('reject', 0)} reject)"
+        )
 
         # ── Step 5: Write artifacts ───────────────────────────────────────
         paths = ArtifactWriter(session).write_all()

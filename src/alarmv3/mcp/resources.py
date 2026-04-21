@@ -78,6 +78,59 @@ def register_resources(mcp: FastMCP) -> None:
             result.append(d)
         return json.dumps(result, indent=2)
 
+    @mcp.resource("implementation://plan")
+    def implementation_plan() -> str:
+        """Current implementation plan: ordered list of changes to apply."""
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session:
+            return json.dumps({"error": "No active session."})
+        db_path = session.artifact_dir / "analysis.db"
+        if not db_path.exists():
+            return json.dumps([])
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT id, rec_rank, title, affected_files, order_index, status "
+                "FROM implementation_plan WHERE session_id=? ORDER BY order_index",
+                (session.session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["affected_files"] = json.loads(d["affected_files"])
+            result.append(d)
+        return json.dumps(result, indent=2)
+
+    @mcp.resource("implementation://changes")
+    def implementation_changes() -> str:
+        """All generated code changes with diffs, evaluator results, and review status."""
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session:
+            return json.dumps({"error": "No active session."})
+        db_path = session.artifact_dir / "analysis.db"
+        if not db_path.exists():
+            return json.dumps([])
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT ic.id, ic.plan_item_id, ip.title, ip.order_index, "
+                "ic.diff_text, ic.eval_verdict, ic.eval_critique, "
+                "ic.review_status, ic.feedback, ic.commit_hash, ic.created_at "
+                "FROM implementation_change ic "
+                "JOIN implementation_plan ip ON ip.id = ic.plan_item_id "
+                "WHERE ic.session_id=? ORDER BY ic.created_at DESC",
+                (session.session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return json.dumps([dict(r) for r in rows], indent=2)
+
     @mcp.resource("recommendations://evaluated")
     def recommendations_evaluated() -> str:
         """Recommendations with adversarial evaluator critique and scores.
