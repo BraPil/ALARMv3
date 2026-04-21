@@ -204,10 +204,24 @@ CREATE INDEX IF NOT EXISTS idx_coverage_session
     ON analysis_coverage(session_id);
 """
 
+_LANGUAGE_GRAMMAR = """
+CREATE TABLE IF NOT EXISTS language_grammar (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT    NOT NULL,
+    file_ext      TEXT    NOT NULL,
+    language_name TEXT    NOT NULL,
+    grammar_json  TEXT    NOT NULL,
+    created_at    REAL    NOT NULL,
+    UNIQUE(session_id, file_ext)
+);
+CREATE INDEX IF NOT EXISTS idx_grammar_session
+    ON language_grammar(session_id);
+"""
+
 _ALL_SCHEMAS = [
     _MANIFEST, _DEPENDENCY, _SYMBOL, _COMPLEXITY, _CHUNK,
     _RECOMMENDATION, _IMPLEMENTATION_PLAN, _IMPLEMENTATION_CHANGE,
-    _SUBSYSTEM, _SUBSYSTEM_FINDING, _ANALYSIS_COVERAGE,
+    _SUBSYSTEM, _SUBSYSTEM_FINDING, _ANALYSIS_COVERAGE, _LANGUAGE_GRAMMAR,
 ]
 
 

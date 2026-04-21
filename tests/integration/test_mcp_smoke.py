@@ -41,6 +41,8 @@ EXPECTED_TOOLS = {
     "query_cross_repo",
     # Phase 6
     "run_deep_analysis",
+    # Phase 7
+    "research_unknown_languages",
 }
 
 

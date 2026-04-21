@@ -681,6 +681,81 @@ def register_tools(mcp: FastMCP) -> None:
             g.log_error("run_deep_analysis", str(e))
             raise
 
+    # ── Phase 7 tools ──────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def research_unknown_languages(
+        session_id: str,
+        max_samples_per_language: int = 5,
+        persist_on_success: bool = True,
+    ) -> dict:
+        """Infer grammar patterns for files that discovery could not classify.
+
+        Discovery marks files with unrecognised extensions as ineligible
+        (e.g. AutoLISP .lsp/.dcl, PowerShell .ps1/.psm1, COBOL .cob, etc.).
+        This tool runs a one-shot Claude call per language family on a small
+        sample of those files to learn their syntax, then:
+
+          1. Extracts inferred function/class/import symbols using the learned
+             regex patterns and stores them in the existing symbol and
+             dependency_edge tables (symbol_type='inferred_function', etc.)
+          2. Marks previously-ineligible files as eligible so they appear in
+             subsequent analysis passes
+          3. If the symbol yield passes a plausibility gate, persists the
+             grammar to ProjectMemory (category='pattern') so future sessions
+             can skip the Claude inference step
+
+        Runs in the background. Call get_job_status(job_id) to poll.
+        Best called AFTER start_full_mapping completes but BEFORE
+        run_analysis or run_deep_analysis, so inferred symbols are included
+        in the semantic graph.
+
+        Requires state: ANALYSIS_IN_PROGRESS.
+
+        Args:
+            session_id: The session ID.
+            max_samples_per_language: Max file samples sent to Claude per
+                                      unknown extension (default 5).
+            persist_on_success: Whether to write validated grammars to
+                                ProjectMemory for reuse in future sessions
+                                (default True).
+        """
+        sm = SessionManager(_workspace())
+        session = sm.get()
+        if not session or session.session_id != session_id:
+            raise ValueError(f"No active session with id: {session_id}")
+
+        g = session.guardrails
+        g.log_tool_call("research_unknown_languages", {
+            "session_id": session_id,
+            "max_samples_per_language": max_samples_per_language,
+            "persist_on_success": persist_on_success,
+        })
+
+        try:
+            g.require_state(session.state, SessionState.ANALYSIS_IN_PROGRESS)
+            max_samples_per_language = min(max(1, max_samples_per_language), 20)
+
+            from ..core.orchestration import Orchestrator
+            job_id = Orchestrator(session).start_language_research(
+                max_samples_per_language=max_samples_per_language,
+                persist_on_success=persist_on_success,
+            )
+
+            return {
+                "session_id": session_id,
+                "job_id": job_id,
+                "state": session.state.value,
+                "next_step": (
+                    f"Poll get_job_status('{job_id}') until status='complete'. "
+                    "Then continue with run_analysis or run_deep_analysis — "
+                    "inferred symbols will be included automatically."
+                ),
+            }
+        except GuardrailViolation as e:
+            g.log_error("research_unknown_languages", str(e))
+            raise
+
     # ── Phase 5 tools ──────────────────────────────────────────────────────
 
     @mcp.tool()
