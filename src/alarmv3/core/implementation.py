@@ -690,16 +690,93 @@ def _load_file_contents(affected_files: list[str], target: Path) -> dict[str, st
 
 
 def _apply_diff(diff_text: str, target: Path) -> None:
-    """Apply a unified diff to the target directory using patch."""
-    result = subprocess.run(
-        ["patch", "-p1", "--forward", "--reject-file=-"],
-        input=diff_text.encode(),
-        cwd=target,
-        capture_output=True,
-    )
-    if result.returncode not in (0, 1):
-        stderr = result.stderr.decode(errors="replace")
-        raise RuntimeError(f"patch failed (rc={result.returncode}): {stderr}")
+    """Apply a unified diff produced by an LLM to the target directory.
+
+    LLM diffs routinely have three issues that defeat standard patch/git-apply:
+    1. Wrapped in ```diff ... ``` fences
+    2. File paths carry a leading source-repo prefix (e.g. a/workspaces/ADDS/...)
+       rather than being relative to the target root
+    3. Hunk @@ line counts that are off by a few lines
+
+    Strategy: reconstruct each file's new content from the diff's context (+)
+    and unchanged ( ) lines, stripping removed (-) lines. This is immune to
+    hunk-count errors and path-prefix confusion.
+    """
+    import re as _re
+
+    # Strip markdown fences and normalise line endings
+    text = diff_text.replace("\r\n", "\n")
+    text = _re.sub(r"^```[a-z]*\n?", "", text, flags=_re.MULTILINE)
+    text = text.replace("```", "").strip()
+
+    lines = text.splitlines()
+
+    # Parse into per-file hunks
+    # Collect (target_rel_path, list_of_hunk_lines) pairs
+    files: list[tuple[str, list[str]]] = []
+    cur_path: str | None = None
+    cur_lines: list[str] = []
+
+    def _extract_path(header: str) -> str:
+        """Strip a/b prefix and any leading absolute path components."""
+        # Remove leading a/ or b/
+        p = _re.sub(r"^[ab]/", "", header.strip())
+        # If path still looks absolute or contains the source root, strip
+        # everything up to the first path component that exists in target
+        parts = Path(p).parts
+        for i in range(len(parts)):
+            candidate = Path(*parts[i:])
+            if (target / candidate).exists():
+                return str(candidate)
+        return p  # best effort
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("--- "):
+            # Save previous file
+            if cur_path is not None:
+                files.append((cur_path, cur_lines))
+            cur_lines = []
+            cur_path = None
+            # Next line should be +++
+            if i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+                raw = lines[i + 1][4:].split("\t")[0]  # strip timestamp
+                cur_path = _extract_path(raw)
+                i += 2
+                continue
+        elif line.startswith("@@ "):
+            pass  # hunk header — just skip, we don't need line counts
+        elif cur_path is not None and not line.startswith("--- "):
+            cur_lines.append(line)
+        i += 1
+
+    if cur_path is not None:
+        files.append((cur_path, cur_lines))
+
+    if not files:
+        return  # nothing to apply
+
+    for rel_path, hunk_lines in files:
+        dest = target / rel_path
+        if not dest.exists():
+            continue  # skip files not present in target
+
+        # Rebuild new file content from context + added lines
+        new_content_lines = []
+        for ln in hunk_lines:
+            if ln.startswith("+"):
+                new_content_lines.append(ln[1:])
+            elif ln.startswith("-"):
+                pass  # removed line
+            elif ln.startswith("@@ "):
+                pass  # hunk header inside lines list
+            else:
+                # Context line (starts with space or is bare)
+                new_content_lines.append(ln[1:] if ln.startswith(" ") else ln)
+
+        if new_content_lines:
+            dest.write_text("\n".join(new_content_lines) + "\n", encoding="utf-8")
 
 
 def _git_commit(target: Path, message: str) -> str | None:
