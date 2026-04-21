@@ -75,6 +75,22 @@ class Orchestrator:
         thread.start()
         return job_id
 
+    def start_language_research(
+        self,
+        max_samples_per_language: int = 5,
+        persist_on_success: bool = True,
+    ) -> str:
+        """Research unknown-language files in a background thread. Returns job_id."""
+        job_id = self._new_job("language_research")
+        thread = threading.Thread(
+            target=self._run_language_research,
+            args=(job_id, max_samples_per_language, persist_on_success),
+            daemon=True,
+            name=f"alarmv3-langresearch-{job_id[:8]}",
+        )
+        thread.start()
+        return job_id
+
     def synthesize_recommendations(self, aaa_grounding: "str | None" = None) -> dict:
         """Run synthesis then adversarial evaluation. Returns combined result dict."""
         from .evaluation import RecommendationEvaluator
@@ -157,6 +173,27 @@ class Orchestrator:
                 outlier_files_analyzed=result["outlier_files_analyzed"],
                 raw_findings_count=result["raw_findings_count"],
                 evaluator_summary=result["evaluator_summary"],
+            )
+        except Exception as e:
+            self._fail_job(job_id, str(e))
+
+    def _run_language_research(
+        self,
+        job_id: str,
+        max_samples_per_language: int,
+        persist_on_success: bool,
+    ) -> None:
+        try:
+            from .language_researcher import LanguageResearcher
+            result = LanguageResearcher(self._session).run(
+                max_samples_per_language=max_samples_per_language,
+                persist_on_success=persist_on_success,
+            )
+            self._finish_job(
+                job_id,
+                languages_researched=result["languages_researched"],
+                total_symbols_inferred=result["total_symbols_inferred"],
+                details=result.get("details", []),
             )
         except Exception as e:
             self._fail_job(job_id, str(e))

@@ -28,6 +28,7 @@ src/alarmv3/
 │   ├── evaluation.py    Adversarial evaluator — separate Claude call (Phase 3)
 │   ├── implementation.py Plan/build/eval pipeline + git commit to TARGET (Phase 4)
 │   ├── artifacts.py     Markdown/JSON output writers
+│   ├── language_researcher.py  Runtime grammar inference for unknown extensions (Phase 7)
 │   └── orchestration.py ThreadPoolExecutor harness + SQLite work queue
 ├── mcp/           Thin wrapper. Delegates ALL logic to core. No business logic here.
 │   ├── server.py        FastMCP entry point (stdio Phase 1; HTTP planned Phase 3)
@@ -219,6 +220,66 @@ Parameters: `max_subsystems` (default 15, max 30), `cyclomatic_threshold` (defau
 | `subsystem_finding` | Raw Claude findings per pass before aggregation |
 | `analysis_coverage` | Per-file coverage tracking across pass types |
 
+## Phase 7: runtime language researcher
+
+`core/language_researcher.py` — three-tier self-improving language support for unknown extensions
+(AutoLISP `.lsp/.dcl`, PowerShell `.ps1/.psm1`, COBOL, MUMPS, etc.).
+
+### Architecture
+
+```
+Tier 1 — detection (unchanged discovery.py)
+  └─ unknown-extension files marked is_eligible=0, language=NULL in manifest
+
+Tier 2 — runtime inference (LanguageResearcher)
+  └─ groups ineligible files by extension
+  └─ checks language_grammar cache (session-local) → ProjectMemory (cross-session)
+  └─ if no cache: samples up to 5 files, sends to Claude → grammar descriptor
+       grammar: {language_name, function_patterns[], class_patterns[], import_patterns[], notes}
+  └─ applies patterns line-by-line to ALL files of that extension
+  └─ writes inferred symbols → symbol table (symbol_type='inferred_function' | 'inferred_class')
+  └─ writes inferred deps   → dependency_edge table (dep_type='inferred_import')
+  └─ marks files is_eligible=1 so downstream passes include them
+
+Tier 3 — validated persistence
+  └─ if symbol yield ≥ 3 AND names pass _PLAUSIBLE_NAME_RE:
+       cache grammar in language_grammar table (session-local hit on re-run)
+       persist to ProjectMemory category='pattern', key='language/<ext>'
+       → future sessions skip the Claude inference step entirely
+```
+
+### LLM boundary note
+
+Grammar inference is a meta-task: we feed tiny FILE SAMPLES so Claude can DESCRIBE the syntax.
+This is explicitly not architecture analysis. The board rule ("LLM reads semantic graph, not raw
+source files") applies to recommendation generation, not to learning what `defun` means in AutoLISP.
+
+### Recommended workflow with deep analysis
+
+```
+start_full_mapping(session_id)          → wait complete
+research_unknown_languages(session_id)  → wait complete  ← NEW — do this before analysis
+run_analysis(session_id)                → wait complete
+run_deep_analysis(session_id)           → wait complete
+review_recommendations(session_id, ...)
+```
+
+### New MCP tool
+
+| Tool | State gate | Purpose |
+|------|-----------|---------|
+| `research_unknown_languages` | ANALYSIS_IN_PROGRESS | Background grammar inference; returns job_id |
+
+Parameters: `max_samples_per_language` (default 5, max 20), `persist_on_success` (default True).
+
+### New DB table (analysis.db per session)
+
+| Table | Purpose |
+|-------|---------|
+| `language_grammar` | Cached grammar descriptors (JSON) per extension per session |
+
+---
+
 ## Phase roadmap
 
 | Phase | Scope | Key deliverable |
@@ -228,5 +289,6 @@ Parameters: `max_subsystems` (default 15, max 30), `cyclomatic_threshold` (defau
 | 3 | Risk-weighted priority, AAA integration | Effort estimates, persona recommendations |
 | 4 | Implementation mode | Adversarial Dev pattern, separate cloned dir |
 | 5 | Persistent memory, autopilot, parallel batch, cross-repo | Enterprise-scale modernization |
-| 6 (current) | Deep analysis engine | Exhaustive subsystem-partitioned multi-pass synthesis |
-| 7 | Continuous mode, SharePoint sync | Re-run on commit, team features |
+| 6 | Deep analysis engine | Exhaustive subsystem-partitioned multi-pass synthesis |
+| 7 (current) | Runtime language researcher | Self-improving grammar inference for unknown languages |
+| 8 | Continuous mode, SharePoint sync | Re-run on commit, team features |
