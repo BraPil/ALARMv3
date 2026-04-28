@@ -699,88 +699,34 @@ def _apply_diff(diff_text: str, target: Path) -> None:
        rather than being relative to the target root
     3. Hunk @@ line counts that are off by a few lines
     4. Git quotes paths that contain spaces (e.g. "a/Original files/Foo.cs")
+    5. Partial hunks — only changed regions of long files are diffed; lines
+       outside the hunks must be preserved verbatim from the original file.
 
-    Strategy: reconstruct each file's new content from the diff's context (space)
-    and added (+) lines, stripping removed (-) lines. Three application modes:
-
-      - Modify in place (--- a/foo, +++ b/foo): write new content to foo.
-      - New file       (--- /dev/null, +++ b/foo): create foo with the + lines.
-      - Rename         (--- a/foo, +++ b/bar where foo != bar): write content
-                       to bar, delete foo.
-
-    This is immune to hunk-count errors and path-prefix confusion.
+    Strategy:
+      - Parse the diff into per-file blocks, each with a list of hunks.
+      - For modify-in-place / rename: read the original from target, splice
+        each hunk at its declared @@ -X,Y position so out-of-hunk lines are
+        preserved. Tolerant of small line-count drift.
+      - For new file (--- /dev/null): build content from hunk's + and context
+        lines (no original to splice into).
+      - For delete (+++ /dev/null): unlink the source.
     """
     import re as _re
 
-    # Strip markdown fences and normalise line endings
     text = diff_text.replace("\r\n", "\n")
     text = _re.sub(r"^```[a-z]*\n?", "", text, flags=_re.MULTILINE)
     text = text.replace("```", "").strip()
-
     lines = text.splitlines()
 
-    # Parse into per-file hunks. Each entry is (source_rel | None, dest_rel | None, hunk_lines)
-    # where source is None for new-file diffs (--- /dev/null) and dest is None
-    # for malformed entries we'll skip.
-    files: list[tuple[Optional[str], Optional[str], list[str]]] = []
-    cur_source: Optional[str] = None
-    cur_dest: Optional[str] = None
-    cur_lines: list[str] = []
+    file_blocks = _parse_diff_blocks(lines, target)
 
-    def _extract_path(header: str) -> Optional[str]:
-        """Returns None for /dev/null, else the relative path within target."""
-        p = header.strip()
-        # Git quotes paths that contain spaces (e.g. "a/Original files/Foo.Cmd")
-        if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
-            p = p[1:-1]
-        if p == "/dev/null":
-            return None
-        # Remove leading a/ or b/
-        p = _re.sub(r"^[ab]/", "", p)
-        # Walk path components looking for one that exists in target. For
-        # NEW files this returns the as-is path (none of its prefixes exist
-        # yet but its parent directory should — we check that at apply time).
-        parts = Path(p).parts
-        for i in range(len(parts)):
-            candidate = Path(*parts[i:])
-            if (target / candidate).exists():
-                return str(candidate)
-        return p  # best effort — verify parent dir exists before writing
+    for block in file_blocks:
+        src_rel = block["source"]
+        dest_rel = block["dest"]
+        hunks = block["hunks"]
 
-    def _flush() -> None:
-        files.append((cur_source, cur_dest, cur_lines))
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.startswith("--- "):
-            # Save previous file before starting a new one
-            if cur_dest is not None or cur_source is not None:
-                _flush()
-            cur_lines = []
-            raw_src = line[4:].split("\t")[0]
-            cur_source = _extract_path(raw_src)
-            cur_dest = None
-            if i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
-                raw_dest = lines[i + 1][4:].split("\t")[0]
-                cur_dest = _extract_path(raw_dest)
-                i += 2
-                continue
-        elif line.startswith("@@ "):
-            pass  # hunk header — line counts aren't needed for our apply
-        elif cur_dest is not None or cur_source is not None:
-            cur_lines.append(line)
-        i += 1
-
-    if cur_dest is not None or cur_source is not None:
-        _flush()
-
-    if not files:
-        return
-
-    for src_rel, dest_rel, hunk_lines in files:
+        # +++ /dev/null — explicit delete.
         if dest_rel is None:
-            # +++ /dev/null — explicit file deletion. Remove the source file.
             if src_rel and (target / src_rel).is_file():
                 try:
                     (target / src_rel).unlink()
@@ -788,21 +734,29 @@ def _apply_diff(diff_text: str, target: Path) -> None:
                     pass
             continue
 
-        # Rebuild new file content from added + context lines
-        new_content_lines = []
-        for ln in hunk_lines:
-            if ln.startswith("+"):
-                new_content_lines.append(ln[1:])
-            elif ln.startswith("-"):
-                pass  # removed line — drop it
-            elif ln.startswith("@@ "):
-                pass  # hunk header buried in the lines list
+        is_new_file = src_rel is None
+        # Read original content for modify/rename cases.
+        if is_new_file:
+            original_lines: list[str] = []
+        else:
+            src_path = target / src_rel
+            if src_path.is_file():
+                try:
+                    original_lines = src_path.read_text(errors="replace").splitlines()
+                except OSError:
+                    original_lines = []
             else:
-                new_content_lines.append(ln[1:] if ln.startswith(" ") else ln)
+                # Diff says "modify foo" but foo doesn't exist — treat as new.
+                original_lines = []
+                is_new_file = True
 
-        # Pure-deletion case: every line in the diff was removed and the dest
-        # is /dev/null. Treat as a delete of the source file.
-        if not new_content_lines:
+        new_lines = _splice_hunks(original_lines, hunks)
+        if not new_lines and is_new_file:
+            # Nothing to write.
+            continue
+
+        # Pure-delete fallback: every original line removed and no additions.
+        if not new_lines and not is_new_file:
             if src_rel and (target / src_rel).is_file():
                 try:
                     (target / src_rel).unlink()
@@ -811,28 +765,203 @@ def _apply_diff(diff_text: str, target: Path) -> None:
             continue
 
         dest_path = target / dest_rel
-        # Safety: only write if either the dest already exists (modify case),
-        # the source exists (rename case), or the parent directory exists
-        # (new-file in known dir). This rejects writes into hallucinated
-        # paths from malformed diffs.
-        is_new_file = src_rel is None
-        is_modify_or_rename = src_rel is not None and (target / src_rel).exists()
         parent_exists = dest_path.parent.exists()
+        is_modify_or_rename = src_rel is not None and (target / src_rel).exists()
         if not (dest_path.exists() or is_modify_or_rename or (is_new_file and parent_exists)):
             continue
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_path.write_text("\n".join(new_content_lines) + "\n", encoding="utf-8")
+        dest_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
-        # Rename case: --- a/foo, +++ b/bar with foo != bar. We've written
-        # the new content; now remove the old file.
-        if (src_rel
-                and src_rel != dest_rel
-                and (target / src_rel).is_file()):
+        # Rename: write content to dest, delete source.
+        if (src_rel and src_rel != dest_rel and (target / src_rel).is_file()):
             try:
                 (target / src_rel).unlink()
             except OSError:
                 pass
+
+
+def _parse_diff_blocks(lines: list[str], target: Path) -> list[dict]:
+    """Parse a unified diff into per-file blocks with structured hunk lists.
+
+    Each returned block is:
+      {"source": rel_or_None, "dest": rel_or_None, "hunks": [{"src_start": int,
+       "src_count": int, "body": [str, ...]}, ...]}
+    """
+    import re as _re
+
+    HUNK_HEADER = _re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+    def _extract_path(header: str) -> Optional[str]:
+        p = header.strip()
+        if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+            p = p[1:-1]
+        if p == "/dev/null":
+            return None
+        p = _re.sub(r"^[ab]/", "", p)
+        parts = Path(p).parts
+        for i in range(len(parts)):
+            candidate = Path(*parts[i:])
+            if (target / candidate).exists():
+                return str(candidate)
+        return p
+
+    blocks: list[dict] = []
+    cur: Optional[dict] = None
+    cur_hunk: Optional[dict] = None
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+            if cur is not None:
+                if cur_hunk is not None:
+                    cur["hunks"].append(cur_hunk)
+                blocks.append(cur)
+            raw_src = line[4:].split("\t")[0]
+            raw_dest = lines[i + 1][4:].split("\t")[0]
+            cur = {
+                "source": _extract_path(raw_src),
+                "dest": _extract_path(raw_dest),
+                "hunks": [],
+            }
+            cur_hunk = None
+            i += 2
+            continue
+
+        if cur is None:
+            i += 1
+            continue
+
+        m = HUNK_HEADER.match(line)
+        if m:
+            if cur_hunk is not None:
+                cur["hunks"].append(cur_hunk)
+            src_start = int(m.group(1))
+            src_count = int(m.group(2)) if m.group(2) is not None else 1
+            cur_hunk = {"src_start": src_start, "src_count": src_count, "body": []}
+            i += 1
+            continue
+
+        if cur_hunk is not None:
+            # Skip the "\ No newline at end of file" markers.
+            if not line.startswith("\\"):
+                cur_hunk["body"].append(line)
+        i += 1
+
+    if cur is not None:
+        if cur_hunk is not None:
+            cur["hunks"].append(cur_hunk)
+        blocks.append(cur)
+    return blocks
+
+
+def _splice_hunks(original_lines: list[str], hunks: list[dict]) -> list[str]:
+    """Apply structured hunks against original_lines and return new lines.
+
+    Walks the original line cursor forward, copying out-of-hunk lines verbatim
+    and replacing hunk regions with their (context + added) body lines.
+
+    For each hunk we *fuzzy-locate* the actual splice position by matching the
+    first non-add body line against original_lines near the declared @@ line.
+    LLMs frequently emit @@ headers that are off by 1-3 lines (forgetting blank
+    lines, inserting an extra context line above the change, etc.); without
+    fuzzy matching the splice corrupts the file with duplicated/missing rows.
+    Strict-cursor mode is used as the fallback when no nearby match is found.
+    """
+    if not hunks:
+        return list(original_lines)
+
+    hunks_sorted = sorted(hunks, key=lambda h: h["src_start"])
+
+    output: list[str] = []
+    cursor = 0
+    n = len(original_lines)
+
+    for h in hunks_sorted:
+        # Anchor candidate: the first body line that has a source side
+        # (context " " or removal "-"). Pure-add hunks fall through to header.
+        anchor: Optional[str] = None
+        for body_line in h["body"]:
+            if not body_line:
+                continue
+            tag = body_line[0]
+            if tag in (" ", "-"):
+                anchor = body_line[1:]
+                break
+            if tag not in ("+", "\\"):
+                anchor = body_line  # bare line — treat as context
+                break
+
+        declared = max(0, h["src_start"] - 1)
+        if h["src_start"] == 0:
+            declared = 0
+
+        actual_start = declared
+        if anchor is not None and n > 0:
+            # Search ±10 lines around the declared position for an exact match.
+            best: Optional[int] = None
+            for offset in range(11):
+                for sign in (-1, 1) if offset else (1,):
+                    cand = declared + sign * offset
+                    if cand < cursor or cand >= n:
+                        continue
+                    if original_lines[cand] == anchor:
+                        best = cand
+                        break
+                if best is not None:
+                    break
+            if best is not None:
+                actual_start = best
+
+        # Emit unchanged lines up to the hunk's actual start.
+        while cursor < actual_start and cursor < n:
+            output.append(original_lines[cursor])
+            cursor += 1
+
+        # Apply the hunk body.
+        for body_line in h["body"]:
+            if not body_line:
+                # Blank line in diff body. Emit a blank line and advance cursor
+                # if the original is also blank at that position.
+                if cursor < n and original_lines[cursor] == "":
+                    output.append("")
+                    cursor += 1
+                else:
+                    output.append("")
+                continue
+            tag = body_line[0]
+            payload = body_line[1:]
+            if tag == "+":
+                output.append(payload)
+            elif tag == "-":
+                # Drop original line if it matches; otherwise still advance to
+                # avoid getting stuck on drifted hunks.
+                if cursor < n:
+                    cursor += 1
+            elif tag == " ":
+                # Context — emit and advance. Prefer the original's actual
+                # content if available (handles whitespace-only drift).
+                if cursor < n:
+                    output.append(original_lines[cursor])
+                    cursor += 1
+                else:
+                    output.append(payload)
+            elif tag == "\\":
+                continue
+            else:
+                # No leading marker: treat as context.
+                if cursor < n:
+                    output.append(original_lines[cursor])
+                    cursor += 1
+                else:
+                    output.append(body_line)
+
+    # Emit trailing lines.
+    while cursor < n:
+        output.append(original_lines[cursor])
+        cursor += 1
+    return output
 
 
 def _git_commit(target: Path, message: str) -> str | None:

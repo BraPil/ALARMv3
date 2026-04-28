@@ -131,7 +131,14 @@ class KnowledgeBuilder:
     def _create_chunks(self, conn: sqlite3.Connection) -> int:
         """Create code_chunk rows from symbols + file headers. Returns count created."""
         sid = self._session.session_id
+        source_root = self._session.source_path
         created = 0
+
+        def _resolve(p: str) -> str:
+            """Return an absolute path for filesystem reads, accepting either form."""
+            if Path(p).is_absolute() or source_root is None:
+                return p
+            return str(source_root / p)
 
         # Structure-aware chunks: one per symbol with known line range
         symbols = conn.execute(
@@ -144,7 +151,7 @@ class KnowledgeBuilder:
         ).fetchall()
 
         for sym in symbols:
-            content = _slice_file(sym["file_path"], sym["start_line"], sym["end_line"])
+            content = _slice_file(_resolve(sym["file_path"]), sym["start_line"], sym["end_line"])
             if not content:
                 continue
             if self._chunk_exists(conn, sym["file_path"], sym["start_line"]):
@@ -166,21 +173,25 @@ class KnowledgeBuilder:
             )
             created += 1
 
-        # File-header chunks: imports + first N lines for files with no symbols
+        # File-header chunks: imports + first N lines for files with no symbols.
+        # The symbol table is keyed by relative path; manifest exposes both
+        # absolute (file_path) and relative (relative_path), so use the
+        # relative form for storage and resolve to absolute for reading.
         files_with_symbols = {s["file_path"] for s in symbols}
         eligible = conn.execute(
-            "SELECT file_path FROM manifest WHERE session_id=? AND is_eligible=1",
+            "SELECT file_path, relative_path FROM manifest WHERE session_id=? AND is_eligible=1",
             (sid,),
         ).fetchall()
 
         for row in eligible:
-            fp = row["file_path"]
-            if fp in files_with_symbols:
+            rel_fp = row["relative_path"] or row["file_path"]
+            abs_fp = row["file_path"] or rel_fp
+            if rel_fp in files_with_symbols:
                 continue
-            content = _slice_file(fp, 1, 40)
+            content = _slice_file(abs_fp, 1, 40)
             if not content:
                 continue
-            if self._chunk_exists(conn, fp, 1):
+            if self._chunk_exists(conn, rel_fp, 1):
                 continue
             h = hashlib.sha256(content.encode()).hexdigest()
             conn.execute(
@@ -190,7 +201,7 @@ class KnowledgeBuilder:
                  start_line, end_line, content, content_hash, token_count, embedded)
                 VALUES (?,?,?,?,?,?,?,?,?,0)
                 """,
-                (sid, fp, "file_header", None, 1, 40, content, h, _approx_tokens(content)),
+                (sid, rel_fp, "file_header", None, 1, 40, content, h, _approx_tokens(content)),
             )
             created += 1
 

@@ -42,9 +42,9 @@ _GUID_RE = re.compile(r'^\{[0-9A-Fa-f-]{36}\}$')
 _FRAMEWORK_MODULE_PREFIXES = ("System.", "System$", "Microsoft.", "mscorlib")
 
 _MODEL = "claude-sonnet-4-6"
-_MAX_TOKENS_SUBSYSTEM = 2048
-_MAX_TOKENS_COMPLEXITY = 2048
-_MAX_TOKENS_AGGREGATION = 4096
+_MAX_TOKENS_SUBSYSTEM = 6144
+_MAX_TOKENS_COMPLEXITY = 4096
+_MAX_TOKENS_AGGREGATION = 8192
 _MAX_SYMBOLS_PER_PASS = 150   # cap per subsystem to stay within context
 _MAX_EDGES_PER_PASS = 200
 # Source-excerpt budget for the per-subsystem prompt. Without source, the
@@ -52,32 +52,45 @@ _MAX_EDGES_PER_PASS = 200
 # languages (AutoLISP, AutoCAD-binaries-as-text) is opaque enough that the
 # subsystem pass returns []. Including ~6 representative files at ~150 lines
 # each gives the model real architecture to reason about.
-_MAX_REPRESENTATIVE_FILES = 6
-_MAX_LINES_PER_EXCERPT = 150
-_MAX_EXCERPT_CHARS = 8000     # per-file safety cap
+_MAX_REPRESENTATIVE_FILES = 8
+_MAX_LINES_PER_EXCERPT = 200
+_MAX_EXCERPT_CHARS = 10000    # per-file safety cap
+_MAX_TOTAL_EXCERPT_CHARS = 60000  # total cap across all reps in one prompt
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
 _SUBSYSTEM_PROMPT = """\
-You are a senior software architect analyzing one subsystem of a legacy codebase.
+You are a senior software architect analyzing one subsystem of a legacy
+codebase that is the explicit target of a modernization initiative. Treat the
+codebase as old enough that *something* will be visible — outdated language
+constructs, deprecated APIs, hardcoded paths, missing error handling, copy-paste
+patterns, dead code, security anti-patterns. The user already knows it needs
+modernization; your job is to enumerate concrete findings, not to validate
+whether modernization is warranted.
 
-You receive the dependency graph, symbol table, complexity metrics, AND source
-excerpts from the most representative files in this cluster. Read the source
-excerpts carefully — they are short, deliberate samples chosen to expose the
-real architecture. Use them as the primary reasoning input.
+You receive the dependency graph, symbol table, complexity metrics, AND raw
+source excerpts from the most representative files in this cluster. The
+source excerpts are the primary reasoning input — read them line by line.
 
-This is a legacy codebase. Assume there are modernization opportunities; an
-empty result should only be returned when you have *read the source* and
-genuinely see no issues.
+Focus on, in roughly this priority:
+1. Security issues in the source — hardcoded credentials/paths/PII, injection
+   risk, overly broad permissions, plaintext secrets, missing input validation
+2. Modernization opportunities — outdated APIs, deprecated frameworks/runtimes,
+   language version uplift, sync→async migration, removed third-party deps
+3. Quality debt — missing error handling, copy-paste duplication, dead code,
+   god objects, missing interfaces, fragile coupling
+4. Architectural violations — circular dependencies, layer leaks, cross-cutting
+   concerns, missing abstractions across files
+5. Natural seams for extraction or shared utilities
 
-Focus on:
-1. God objects / files with excessive responsibility (high symbol count, high LOC)
-2. Architectural violations — circular dependencies, layer leaks, cross-cutting concerns
-3. Security issues visible in the source (dangerous patterns, missing abstractions, hardcoded credentials, injection risk)
-4. Quality debt — missing interfaces, poor cohesion, fragile coupling, dead code, copy-paste
-5. Modernization opportunities — outdated APIs, deprecated frameworks, language version uplift, async/await migration
-6. Natural seams for extraction or shared abstractions across files
+Be specific. Cite file paths. When you cite a pattern, name the symbol or
+keyword you saw. Avoid vague findings like "consider refactoring" — every
+finding must point at a concrete defect with a concrete fix shape.
+
+For inferred languages (AutoLISP, DCL, .pat, .atc, .xtp, etc.) the same rules
+apply: hardcoded UNC paths, embedded usernames, OS-specific command literals,
+duplicate scripts that differ only in parameters, etc. — these all count.
 
 Return ONLY a valid JSON array of findings:
 [{
@@ -90,7 +103,8 @@ Return ONLY a valid JSON array of findings:
   "rationale": "one sentence on why this matters now"
 }]
 
-Up to 10 findings. If the subsystem is clean, return [].
+Up to 10 findings. If you genuinely cannot see a single concrete defect after
+reading the excerpts (extremely rare for a 35-year-old codebase), return [].
 No text outside the JSON array.\
 """
 
@@ -422,7 +436,7 @@ class DeepSynthesizer:
 
     def _call_subsystem(self, context: dict, name: str) -> list[dict]:
         client = anthropic.Anthropic()
-        content = f"## Subsystem: {name}\n\n{json.dumps(context, indent=2)}"
+        content = _format_subsystem_message(name, context)
         msg = client.messages.create(
             model=_MODEL,
             max_tokens=_MAX_TOKENS_SUBSYSTEM,
@@ -749,14 +763,67 @@ def _select_representative_files(
     return [f for _, f in scores[:_MAX_REPRESENTATIVE_FILES]]
 
 
+def _format_subsystem_message(name: str, context: dict) -> str:
+    """Format the subsystem message so source excerpts appear as raw code blocks.
+
+    JSON-encoding source code escapes newlines and quotes, which forces the
+    model to mentally re-parse the text. Putting code in fenced blocks keeps
+    it readable and dramatically improves the quality of findings.
+    """
+    excerpts = context.get("source_excerpts", []) or []
+    metadata = {k: v for k, v in context.items() if k != "source_excerpts"}
+
+    parts: list[str] = [f"## Subsystem: {name}\n"]
+    parts.append(
+        f"This subsystem contains {metadata.get('file_count', 0)} files. "
+        f"Below: (1) the most representative files as raw source, "
+        f"(2) symbols, dependency edges, and per-file metrics.\n"
+    )
+
+    if excerpts:
+        parts.append("---\n## Representative source files\n")
+        for ex in excerpts:
+            f = ex.get("file", "unknown")
+            content = ex.get("content", "")
+            lang_hint = _language_fence(f)
+            parts.append(f"### `{f}`\n\n```{lang_hint}\n{content}\n```\n")
+
+    parts.append("---\n## Structured metadata (JSON)\n")
+    parts.append("```json\n" + json.dumps(metadata, indent=2) + "\n```\n")
+    return "\n".join(parts)
+
+
+def _language_fence(file_path: str) -> str:
+    """Pick a fence language hint from extension. Falls back to text."""
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    return {
+        "cs": "csharp", "vb": "vbnet", "py": "python", "js": "javascript",
+        "ts": "typescript", "java": "java", "cpp": "cpp", "h": "cpp",
+        "lsp": "lisp", "lisp": "lisp", "mnl": "lisp",
+        "ps1": "powershell", "psm1": "powershell",
+        "sh": "bash", "cmd": "bat", "bat": "bat",
+        "sql": "sql", "xml": "xml", "html": "html", "htm": "html",
+        "json": "json", "yaml": "yaml", "yml": "yaml", "ini": "ini",
+        "md": "markdown",
+    }.get(ext, "text")
+
+
 def _read_source_excerpts(
     rel_paths: list[str],
     source_root: Path,
 ) -> list[dict]:
-    """Read the first _MAX_LINES_PER_EXCERPT lines of each representative file."""
+    """Read the first _MAX_LINES_PER_EXCERPT lines of each representative file.
+
+    Accepts both relative-to-source-root paths (the canonical form) and
+    legacy absolute paths from earlier extractor versions.
+    """
     excerpts: list[dict] = []
+    total_chars = 0
     for rel in rel_paths:
-        full = source_root / rel
+        if total_chars >= _MAX_TOTAL_EXCERPT_CHARS:
+            break
+        candidate = Path(rel)
+        full = candidate if candidate.is_absolute() else (source_root / rel)
         try:
             text = full.read_text(errors="replace")
         except OSError:
@@ -764,8 +831,14 @@ def _read_source_excerpts(
         snippet = "\n".join(text.splitlines()[:_MAX_LINES_PER_EXCERPT])
         if len(snippet) > _MAX_EXCERPT_CHARS:
             snippet = snippet[:_MAX_EXCERPT_CHARS] + "\n... [excerpt truncated]"
-        if snippet.strip():
-            excerpts.append({"file": rel, "content": snippet})
+        if not snippet.strip():
+            continue
+        # Respect the global budget — truncate the last entry if needed.
+        remaining = _MAX_TOTAL_EXCERPT_CHARS - total_chars
+        if len(snippet) > remaining:
+            snippet = snippet[:remaining] + "\n... [budget truncated]"
+        excerpts.append({"file": rel, "content": snippet})
+        total_chars += len(snippet)
     return excerpts
 
 
@@ -823,13 +896,62 @@ def _build_complexity_context(session_id: str, outlier_files: list[str], db_path
 
 
 def _parse_findings(text: str) -> list[dict]:
-    """Extract JSON array of findings from Claude's response."""
+    """Extract JSON array of findings from Claude's response.
+
+    Handles three failure modes that have actually occurred:
+      - Response prefixed with ```json fence (start of array still parseable).
+      - Response truncated by max_tokens mid-finding (needs balanced-bracket
+        recovery — drop the partial last item and close the array).
+      - Response wrapped in extra prose; the array is still locatable by
+        scanning for the first `[` followed by a `{`.
+    """
     start = text.find("[")
+    if start < 0:
+        return []
+    # First try the fast path: the array closes cleanly.
     end = text.rfind("]") + 1
-    if start < 0 or end <= start:
-        return []
-    try:
-        result = json.loads(text[start:end])
-        return result if isinstance(result, list) else []
-    except json.JSONDecodeError:
-        return []
+    if end > start:
+        try:
+            result = json.loads(text[start:end])
+            if isinstance(result, list):
+                return [r for r in result if isinstance(r, dict)]
+        except json.JSONDecodeError:
+            pass
+
+    # Recovery path: walk from `start` and collect complete top-level objects.
+    # Bracket counting with string-state tracking keeps us out of trouble on
+    # quoted brackets/braces inside finding descriptions.
+    i = start + 1
+    depth = 0
+    in_string = False
+    escape = False
+    obj_start: Optional[int] = None
+    findings: list[dict] = []
+    while i < len(text):
+        ch = text[i]
+        if escape:
+            escape = False
+        elif ch == "\\" and in_string:
+            escape = True
+        elif ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch == "{":
+                if depth == 0:
+                    obj_start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and obj_start is not None:
+                    candidate = text[obj_start:i + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict):
+                            findings.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    obj_start = None
+            elif ch == "]" and depth == 0:
+                break
+        i += 1
+    return findings

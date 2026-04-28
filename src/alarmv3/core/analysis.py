@@ -106,15 +106,21 @@ class Analyzer:
                 self._session.fail_work(item_id, str(e))
                 return {"symbols": 0}
 
+            # All downstream tables key on manifest.relative_path. Convert the
+            # absolute work-queue path to source-root-relative before writing,
+            # so symbol/complexity_metric/dependency_edge join cleanly with the
+            # paths emitted by language_researcher (which are already relative).
+            rel_path = self._to_relative(file_path)
+
             symbol_count = 0
             parser = self._parsers.get(language)
             if parser:
-                symbol_count = self._parse_with_tree_sitter(parser, language, content, file_path)
+                symbol_count = self._parse_with_tree_sitter(parser, language, content, file_path, rel_path)
             else:
-                symbol_count = self._parse_with_fallback(language, content, file_path)
+                symbol_count = self._parse_with_fallback(language, content, file_path, rel_path)
 
-            self._compute_complexity(language, content, file_path)
-            self._extract_dependencies(language, content, file_path)
+            self._compute_complexity(language, content, rel_path)
+            self._extract_dependencies(language, content, rel_path)
 
             self._session.complete_work(item_id, {"symbols": symbol_count})
             return {"symbols": symbol_count}
@@ -122,6 +128,16 @@ class Analyzer:
         except Exception as e:
             self._session.fail_work(item_id, str(e))
             raise
+
+    def _to_relative(self, abs_path: Path) -> str:
+        """Return path relative to session.source_path; fall back to str(abs_path)."""
+        source_root = self._session.source_path
+        if source_root is None:
+            return str(abs_path)
+        try:
+            return str(abs_path.relative_to(source_root))
+        except ValueError:
+            return str(abs_path)
 
     def _get_language(self, file_path: Path) -> Optional[str]:
         conn = sqlite3.connect(self._db_path, timeout=10)
@@ -137,18 +153,18 @@ class Analyzer:
 
     # ── Tree-sitter parsing ────────────────────────────────────────────────
 
-    def _parse_with_tree_sitter(self, parser, language: str, content: str, path: Path) -> int:
+    def _parse_with_tree_sitter(self, parser, language: str, content: str, abs_path: Path, rel_path: str) -> int:
         tree = parser.parse(content.encode())
         extractor = _EXTRACTORS.get(language, _generic_extractor)
-        symbols = extractor(tree.root_node, content, str(path), self._session.session_id)
+        symbols = extractor(tree.root_node, content, rel_path, self._session.session_id)
         self._write_symbols(symbols)
         return len(symbols)
 
     # ── Regex / heuristic fallback ─────────────────────────────────────────
 
-    def _parse_with_fallback(self, language: str, content: str, path: Path) -> int:
+    def _parse_with_fallback(self, language: str, content: str, abs_path: Path, rel_path: str) -> int:
         if language == "vbnet":
-            symbols = _extract_vbnet_symbols(content, str(path), self._session.session_id)
+            symbols = _extract_vbnet_symbols(content, rel_path, self._session.session_id)
         else:
             symbols = []
         self._write_symbols(symbols)
@@ -156,7 +172,7 @@ class Analyzer:
 
     # ── Complexity metrics ─────────────────────────────────────────────────
 
-    def _compute_complexity(self, language: str, content: str, path: Path) -> None:
+    def _compute_complexity(self, language: str, content: str, rel_path: str) -> None:
         lines = content.splitlines()
         loc = len([l for l in lines if l.strip() and not l.strip().startswith(("#", "//", "/*", "*", "'''", '"""'))])
 
@@ -172,7 +188,7 @@ class Analyzer:
                     "INSERT OR REPLACE INTO complexity_metric"
                     "(session_id, file_path, metric_name, metric_value, computed_at) "
                     "VALUES (?,?,?,?,?)",
-                    (self._session.session_id, str(path), name, value, time.time()),
+                    (self._session.session_id, rel_path, name, value, time.time()),
                 )
             conn.commit()
         finally:
@@ -180,7 +196,7 @@ class Analyzer:
 
     # ── Dependency extraction ──────────────────────────────────────────────
 
-    def _extract_dependencies(self, language: str, content: str, path: Path) -> None:
+    def _extract_dependencies(self, language: str, content: str, rel_path: str) -> None:
         deps: list[tuple[str, str, int]] = []  # (target, dep_type, line_no)
 
         extractor_fn = _DEP_EXTRACTORS.get(language)
@@ -198,7 +214,7 @@ class Analyzer:
                     "INSERT INTO dependency_edge"
                     "(session_id, source_file, target_module, dep_type, line_number) "
                     "VALUES (?,?,?,?,?)",
-                    (self._session.session_id, str(path), target, dep_type, line_no),
+                    (self._session.session_id, rel_path, target, dep_type, line_no),
                 )
             conn.commit()
         finally:
