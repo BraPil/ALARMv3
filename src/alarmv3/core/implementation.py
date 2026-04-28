@@ -719,8 +719,14 @@ def _apply_diff(diff_text: str, target: Path) -> None:
 
     def _extract_path(header: str) -> str:
         """Strip a/b prefix and any leading absolute path components."""
+        p = header.strip()
+        # Git quotes paths that contain spaces or unicode (e.g.
+        # "a/Original files/Foo.Cmd"). Strip the surrounding quotes before
+        # any other processing or every later check fails.
+        if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+            p = p[1:-1]
         # Remove leading a/ or b/
-        p = _re.sub(r"^[ab]/", "", header.strip())
+        p = _re.sub(r"^[ab]/", "", p)
         # If path still looks absolute or contains the source root, strip
         # everything up to the first path component that exists in target
         parts = Path(p).parts

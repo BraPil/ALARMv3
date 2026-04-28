@@ -189,6 +189,10 @@ def main() -> None:
         result = poll_job(orch, job, "Deep analysis", timeout_s=10800)
         log(f"  Generated {result.get('recommendation_count', '?')} recommendations")
         log(f"  Coverage: {result.get('coverage_pct', '?')}%")
+        # The MCP tool wrapper does this transition, but we call orchestration
+        # directly here, so we have to do it ourselves.
+        if session.state == SessionState.ANALYSIS_IN_PROGRESS:
+            session.transition_to(SessionState.RECOMMENDATIONS_PENDING_REVIEW)
 
     # ── Phase 3 review gate (auto-accept all in non-interactive run) ─────
     if session.state == SessionState.RECOMMENDATIONS_PENDING_REVIEW:

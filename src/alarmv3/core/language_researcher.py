@@ -63,6 +63,22 @@ FILE SAMPLES:
 
 _PLAUSIBLE_NAME_RE = re.compile(r'^[A-Za-z_][\w\-:./]*$')
 
+# Files whose first chunk contains a NUL byte are treated as binary and never
+# sampled. Caps the read size so large binaries don't blow memory.
+_BINARY_PROBE_BYTES = 8192
+
+
+def _looks_textual(path: Path) -> bool:
+    """Return True if the first _BINARY_PROBE_BYTES contain no NUL byte."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(_BINARY_PROBE_BYTES)
+    except OSError:
+        return False
+    if not head:
+        return False
+    return b"\x00" not in head
+
 
 class LanguageResearcher:
     """Infers grammar patterns for unknown language files and populates the symbol table."""
@@ -94,11 +110,16 @@ class LanguageResearcher:
 
             symbols, deps = self._extract_all(ext, grammar, file_paths)
             self._store_results(ext, symbols, deps)
-            self._mark_eligible(ext, file_paths)
 
+            # Only promote files to eligible when the grammar produced enough
+            # plausible symbols. Without this gate, extensions with empty or
+            # binary samples get marked eligible with zero real content and
+            # drown the downstream subsystem partition in noise.
             passed = self._validate(symbols)
-            if persist_on_success and passed:
-                self._persist_grammar(ext, grammar, len(symbols))
+            if passed:
+                self._mark_eligible(ext, file_paths)
+                if persist_on_success:
+                    self._persist_grammar(ext, grammar, len(symbols))
 
             total_symbols += len(symbols)
             researched.append({
@@ -108,6 +129,7 @@ class LanguageResearcher:
                 "symbols": len(symbols),
                 "deps": len(deps),
                 "persisted": persist_on_success and passed,
+                "promoted_to_eligible": passed,
             })
 
         return {
@@ -152,6 +174,12 @@ class LanguageResearcher:
         lines = []
         for p in paths:
             full = source / p if not Path(p).is_absolute() else Path(p)
+            # Reject binary-content files before showing them to Claude.
+            # discovery.IGNORED_EXTENSIONS catches the common cases by name;
+            # this is the second-line defense for unknown extensions whose
+            # contents turn out to be binary (e.g. obscure tool outputs).
+            if not _looks_textual(full):
+                continue
             try:
                 content = full.read_text(errors="replace")
                 snippet = "\n".join(content.splitlines()[:_MAX_SAMPLE_LINES])

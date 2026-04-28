@@ -26,6 +26,7 @@ The final recommendations run through the existing adversarial evaluator.
 """
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -34,6 +35,11 @@ from typing import Callable, Optional
 import anthropic
 
 from .session import Session
+
+_GUID_RE = re.compile(r'^\{[0-9A-Fa-f-]{36}\}$')
+# Modules so common across the codebase that they tell us nothing about
+# clustering — every file imports them.
+_FRAMEWORK_MODULE_PREFIXES = ("System.", "System$", "Microsoft.", "mscorlib")
 
 _MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS_SUBSYSTEM = 2048
@@ -208,17 +214,65 @@ class SubsystemPartitioner:
                     (sid,),
                 ).fetchall()
             ]
-            edges = [
-                (r["source_file"], r["target_file"])
-                for r in conn.execute(
-                    "SELECT source_file, target_file FROM dependency_edge "
-                    "WHERE session_id=? AND target_file IS NOT NULL",
-                    (sid,),
-                ).fetchall()
-            ]
+            # Path normaliser: extractors are inconsistent — tree-sitter
+            # writes absolute paths into dependency_edge.source_file while the
+            # language researcher writes manifest-relative paths. Strip the
+            # source-root prefix so every edge endpoint matches the manifest.
+            source_root = str(self._session.source_path).rstrip("/") + "/"
+
+            def _norm(p: Optional[str]) -> Optional[str]:
+                if not p:
+                    return None
+                return p[len(source_root):] if p.startswith(source_root) else p
+
+            # 1) Resolved file-to-file edges. Most extractors only know
+            #    target_module today, so this set is usually small.
+            resolved_edges: list[tuple[str, str]] = []
+            for r in conn.execute(
+                "SELECT source_file, target_file FROM dependency_edge "
+                "WHERE session_id=? AND target_file IS NOT NULL AND target_file != ''",
+                (sid,),
+            ).fetchall():
+                s, t = _norm(r["source_file"]), _norm(r["target_file"])
+                if s and t:
+                    resolved_edges.append((s, t))
+
+            # 2) Shared-module fallback. Files that import the same internal
+            #    module are coupled. Filter out framework modules (everyone
+            #    imports them) and SLN-section GUIDs.
+            module_index: dict[str, set[str]] = {}
+            for r in conn.execute(
+                "SELECT source_file, target_module FROM dependency_edge "
+                "WHERE session_id=? AND target_module IS NOT NULL AND target_module != ''",
+                (sid,),
+            ).fetchall():
+                mod = (r["target_module"] or "").strip()
+                if not mod or _is_noise_module(mod):
+                    continue
+                src = _norm(r["source_file"])
+                if not src:
+                    continue
+                module_index.setdefault(mod, set()).add(src)
         finally:
             conn.close()
-        return files, edges
+
+        # Cap the cluster signal: skip modules touched by more than half the
+        # codebase (System-level), keep modules with 2+ source files.
+        ubiquity = max(2, len(files) // 2)
+        module_edges: list[tuple[str, str]] = []
+        for mod, srcs in module_index.items():
+            srcs_in_files = sorted(srcs.intersection(files))
+            if 2 <= len(srcs_in_files) <= ubiquity:
+                anchor = srcs_in_files[0]
+                module_edges.extend((anchor, s) for s in srcs_in_files[1:])
+
+        # 3) Path-prefix coupling. Files in the same 3-level directory are
+        #    almost always part of the same subsystem. This is the most
+        #    reliable architectural signal we have when symbol resolution is
+        #    incomplete (which it always is for legacy AutoLISP / VBS / etc).
+        path_edges = _path_prefix_edges(files, depth=3)
+
+        return files, resolved_edges + module_edges + path_edges
 
     def _compute_stats(self, files: list[str]) -> dict:
         if not files:
@@ -489,6 +543,43 @@ class DeepSynthesizer:
 
 # ── Module-level helpers ───────────────────────────────────────────────────────
 
+def _is_noise_module(mod: str) -> bool:
+    """True if this target_module is too generic to use as a clustering signal."""
+    if _GUID_RE.match(mod):
+        return True
+    return any(mod.startswith(prefix) for prefix in _FRAMEWORK_MODULE_PREFIXES) or mod == "System"
+
+
+def _path_prefix_edges(files: list[str], depth: int = 3) -> list[tuple[str, str]]:
+    """Group files by their first `depth` path segments and connect within each group.
+
+    This is the always-on fallback that gives the partitioner a meaningful
+    graph even when no resolved file-to-file edges exist. Without it, every
+    file ends up as its own component and union-find produces one giant
+    "remaining" bucket. Star topology (every file → group anchor) is enough
+    for union-find to merge them into one component.
+    """
+    groups: dict[str, list[str]] = {}
+    for f in files:
+        parts = f.split("/")
+        if len(parts) >= depth:
+            key = "/".join(parts[:depth])
+        elif len(parts) >= 2:
+            key = "/".join(parts[:-1])
+        else:
+            key = "(root)"
+        groups.setdefault(key, []).append(f)
+
+    edges: list[tuple[str, str]] = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        anchor = group[0]
+        for f in group[1:]:
+            edges.append((anchor, f))
+    return edges
+
+
 def _union_find(files: list[str], edges: list[tuple[str, str]]) -> dict[str, list[str]]:
     """Return connected components as {root: [file, ...]} via union-find with path compression."""
     parent = {f: f for f in files}
@@ -516,16 +607,32 @@ def _union_find(files: list[str], edges: list[tuple[str, str]]) -> dict[str, lis
 
 
 def _derive_name(files: list[str], idx: int) -> str:
-    """Derive a human-readable name from the dominant directory in the cluster."""
-    dirs: dict[str, int] = {}
-    for f in files:
-        parts = f.split("/")
-        if len(parts) > 1:
-            dirs[parts[0]] = dirs.get(parts[0], 0) + 1
-    if dirs:
-        dominant = max(dirs, key=lambda d: dirs[d])
-        return f"{dominant}_cluster"
-    return f"subsystem_{idx:03d}"
+    """Derive a human-readable name from the deepest common directory.
+
+    Walks down each path level by level and picks the deepest segment that
+    most files share. This produces names like "19.0/Adds" or
+    "Div_Map Archive/LookUpTable" instead of the always-shared top-level
+    folder when every file lives under one root.
+    """
+    if not files:
+        return f"subsystem_{idx:03d}"
+
+    # Walk from depth 1 outward. At each depth, find the most common prefix.
+    # Stop when no single prefix covers a clear majority of the cluster.
+    parts_by_file = [f.split("/") for f in files]
+    max_depth = min(len(p) for p in parts_by_file)
+    best_name: Optional[str] = None
+    for depth in range(1, max_depth + 1):
+        counts: dict[str, int] = {}
+        for parts in parts_by_file:
+            key = "/".join(parts[:depth])
+            counts[key] = counts.get(key, 0) + 1
+        dominant = max(counts, key=lambda k: counts[k])
+        share = counts[dominant] / len(files)
+        if share < 0.5:
+            break
+        best_name = dominant
+    return f"{best_name}_cluster" if best_name else f"subsystem_{idx:03d}"
 
 
 def _build_subsystem_context(session_id: str, subsystem: dict, db_path: Path) -> dict:

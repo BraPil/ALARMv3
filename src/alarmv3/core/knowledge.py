@@ -206,7 +206,13 @@ class KnowledgeBuilder:
     # ── Embedding ───────────────────────────────────────────────────────────
 
     def _embed_chunks(self, conn: sqlite3.Connection) -> int:
-        """Embed all unembedded chunks. Returns count embedded."""
+        """Embed all unembedded chunks. Returns count embedded.
+
+        Failures on individual chunks (e.g. a chunk that exceeds the embedder's
+        context window even after truncation) are logged and skipped — the
+        rest of the index still gets built. Without this, a single oversized
+        chunk would abort the whole RAG build.
+        """
         sid = self._session.session_id
         pending = conn.execute(
             "SELECT id, content FROM code_chunk WHERE session_id=? AND embedded=0",
@@ -214,8 +220,13 @@ class KnowledgeBuilder:
         ).fetchall()
 
         embedded = 0
+        skipped = 0
         for chunk in pending:
-            vec = _embed(chunk["content"])
+            try:
+                vec = _embed(chunk["content"])
+            except Exception:
+                skipped += 1
+                continue
             conn.execute(
                 "INSERT OR REPLACE INTO chunk_vectors(chunk_id, embedding) VALUES (?, ?)",
                 [chunk["id"], sqlite_vec.serialize_float32(vec)],
@@ -226,13 +237,22 @@ class KnowledgeBuilder:
             embedded += 1
 
         conn.commit()
+        if skipped:
+            self._session.set_metadata("knowledge_skipped_chunks", skipped)
         return embedded
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _embed(text: str) -> list[float]:
-    resp = ollama.embeddings(model=OLLAMA_MODEL, prompt=text[:8000])
+    # nomic-embed-text v1.5 has an 8192-token context window. 4000 chars is
+    # ~1000-1500 code tokens — well inside the limit even for token-dense code.
+    # If a chunk still exceeds context, halve and retry once before giving up.
+    payload = text[:4000]
+    try:
+        resp = ollama.embeddings(model=OLLAMA_MODEL, prompt=payload)
+    except Exception:
+        resp = ollama.embeddings(model=OLLAMA_MODEL, prompt=payload[:2000])
     return resp["embedding"]
 
 

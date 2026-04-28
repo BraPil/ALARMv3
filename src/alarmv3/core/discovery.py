@@ -61,6 +61,33 @@ EXCLUDE_DIRS = frozenset({
     "packages", "vendor",
 })
 
+# Extensions that contribute no source code to analysis. Filtered at discovery
+# time so the manifest stays clean and the Phase 7 language researcher never
+# tries to fabricate a "grammar" for binary or pure-metadata files. (Without
+# this filter, sampling a .bmp produces a Claude grammar with empty pattern
+# lists, the researcher still flips is_eligible=1, and the eligible pool gets
+# drowned in non-source noise — which is exactly what happened on the first
+# full-archive ADDS run.)
+IGNORED_EXTENSIONS = frozenset({
+    # Raster/vector images
+    ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".ico", ".cur",
+    # Compiled / linked binaries (Windows + POSIX)
+    ".dll", ".so", ".dylib", ".exe", ".obj", ".o", ".a", ".lib", ".exp", ".pdb",
+    # ActiveX / AutoCAD compiled extensions
+    ".ocx", ".oca", ".arx", ".vlx",
+    # Archive formats
+    ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".jar", ".war", ".ear",
+    # AutoCAD binary / engineering data
+    ".dwt", ".dst", ".dwg", ".dxf",
+    ".shx", ".slb", ".stb", ".pc3", ".pmp", ".cuix",
+    ".lut",
+    # Office / documentation binaries
+    ".chm", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".rtf",
+    # Windows shell shortcuts and misc binaries
+    ".lnk", ".mnr",
+})
+
 
 class FileScanner:
     """Discovers files in the source zone and populates the manifest."""
@@ -92,6 +119,10 @@ class FileScanner:
                 continue
             # Skip excluded directories anywhere in the path
             if any(part in EXCLUDE_DIRS for part in path.parts):
+                continue
+            # Skip known-binary / non-source extensions before they reach the
+            # manifest or the language researcher
+            if path.suffix.lower() in IGNORED_EXTENSIONS:
                 continue
             yield path
 
