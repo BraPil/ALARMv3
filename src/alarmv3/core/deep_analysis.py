@@ -47,6 +47,14 @@ _MAX_TOKENS_COMPLEXITY = 2048
 _MAX_TOKENS_AGGREGATION = 4096
 _MAX_SYMBOLS_PER_PASS = 150   # cap per subsystem to stay within context
 _MAX_EDGES_PER_PASS = 200
+# Source-excerpt budget for the per-subsystem prompt. Without source, the
+# LLM only sees symbol *names* and dependency edges, which on inferred
+# languages (AutoLISP, AutoCAD-binaries-as-text) is opaque enough that the
+# subsystem pass returns []. Including ~6 representative files at ~150 lines
+# each gives the model real architecture to reason about.
+_MAX_REPRESENTATIVE_FILES = 6
+_MAX_LINES_PER_EXCERPT = 150
+_MAX_EXCERPT_CHARS = 8000     # per-file safety cap
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
@@ -54,16 +62,22 @@ _MAX_EDGES_PER_PASS = 200
 _SUBSYSTEM_PROMPT = """\
 You are a senior software architect analyzing one subsystem of a legacy codebase.
 
-You receive the dependency graph, symbol table, and complexity metrics for a specific
-cluster of files that are strongly coupled to each other. Identify all modernization
-issues in this subsystem.
+You receive the dependency graph, symbol table, complexity metrics, AND source
+excerpts from the most representative files in this cluster. Read the source
+excerpts carefully — they are short, deliberate samples chosen to expose the
+real architecture. Use them as the primary reasoning input.
+
+This is a legacy codebase. Assume there are modernization opportunities; an
+empty result should only be returned when you have *read the source* and
+genuinely see no issues.
 
 Focus on:
 1. God objects / files with excessive responsibility (high symbol count, high LOC)
 2. Architectural violations — circular dependencies, layer leaks, cross-cutting concerns
-3. Security issues visible in the symbol/dependency structure (dangerous patterns, missing abstractions)
-4. Quality debt — missing interfaces, poor cohesion, fragile coupling
-5. Opportunities — natural seams for extraction, common abstractions across files
+3. Security issues visible in the source (dangerous patterns, missing abstractions, hardcoded credentials, injection risk)
+4. Quality debt — missing interfaces, poor cohesion, fragile coupling, dead code, copy-paste
+5. Modernization opportunities — outdated APIs, deprecated frameworks, language version uplift, async/await migration
+6. Natural seams for extraction or shared abstractions across files
 
 Return ONLY a valid JSON array of findings:
 [{
@@ -334,7 +348,10 @@ class DeepSynthesizer:
         for idx, subsystem in enumerate(subsystems):
             pct = 10 + int((idx / max(len(subsystems), 1)) * 55)
             self._progress(pct, f"Analyzing subsystem {idx + 1}/{len(subsystems)}: {subsystem['name']}…")
-            context = _build_subsystem_context(self._session.session_id, subsystem, self._db_path)
+            context = _build_subsystem_context(
+                self._session.session_id, subsystem, self._db_path,
+                source_root=self._session.source_path,
+            )
             findings = self._call_subsystem(context, subsystem["name"])
             self._store_finding(subsystem["index"], "subsystem", findings)
             self._mark_coverage(subsystem["files"], "subsystem")
@@ -635,8 +652,13 @@ def _derive_name(files: list[str], idx: int) -> str:
     return f"{best_name}_cluster" if best_name else f"subsystem_{idx:03d}"
 
 
-def _build_subsystem_context(session_id: str, subsystem: dict, db_path: Path) -> dict:
-    """Build a rich context dict for one subsystem — all metrics, bounded symbols."""
+def _build_subsystem_context(
+    session_id: str,
+    subsystem: dict,
+    db_path: Path,
+    source_root: Optional[Path] = None,
+) -> dict:
+    """Build a rich context dict for one subsystem — all metrics, bounded symbols, source excerpts."""
     files = subsystem["files"]
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -678,8 +700,20 @@ def _build_subsystem_context(session_id: str, subsystem: dict, db_path: Path) ->
             [session_id, *files],
         ).fetchall():
             metrics.setdefault(r["file_path"], {})[r["metric_name"]] = r["metric_value"]
+        symbol_counts = {
+            r["file_path"]: r["n"]
+            for r in conn.execute(
+                f"SELECT file_path, COUNT(*) AS n FROM symbol "
+                f"WHERE session_id=? AND file_path IN ({placeholders}) "
+                f"GROUP BY file_path",
+                [session_id, *files],
+            ).fetchall()
+        }
     finally:
         conn.close()
+
+    representatives = _select_representative_files(files, metrics, symbol_counts)
+    source_excerpts = _read_source_excerpts(representatives, source_root) if source_root else []
 
     return {
         "file_count": len(files),
@@ -689,7 +723,50 @@ def _build_subsystem_context(session_id: str, subsystem: dict, db_path: Path) ->
         "symbols": symbols,
         "internal_dependency_edges": internal_edges,
         "cross_boundary_edges": cross_edges,
+        "source_excerpts": source_excerpts,
     }
+
+
+def _select_representative_files(
+    files: list[str],
+    metrics: dict[str, dict],
+    symbol_counts: dict[str, int],
+) -> list[str]:
+    """Pick up to _MAX_REPRESENTATIVE_FILES files most likely to expose architecture.
+
+    Score = cyclomatic*10 + symbols*2 + loc*0.01. Falls back to symbol count
+    alone for inferred-language files where complexity metrics are absent.
+    """
+    scores: list[tuple[float, str]] = []
+    for f in files:
+        m = metrics.get(f, {}) or {}
+        cyc = float(m.get("cyclomatic", 0) or 0)
+        loc = float(m.get("loc", 0) or 0)
+        syms = float(symbol_counts.get(f, 0))
+        score = cyc * 10.0 + syms * 2.0 + loc * 0.01
+        scores.append((score, f))
+    scores.sort(key=lambda t: -t[0])
+    return [f for _, f in scores[:_MAX_REPRESENTATIVE_FILES]]
+
+
+def _read_source_excerpts(
+    rel_paths: list[str],
+    source_root: Path,
+) -> list[dict]:
+    """Read the first _MAX_LINES_PER_EXCERPT lines of each representative file."""
+    excerpts: list[dict] = []
+    for rel in rel_paths:
+        full = source_root / rel
+        try:
+            text = full.read_text(errors="replace")
+        except OSError:
+            continue
+        snippet = "\n".join(text.splitlines()[:_MAX_LINES_PER_EXCERPT])
+        if len(snippet) > _MAX_EXCERPT_CHARS:
+            snippet = snippet[:_MAX_EXCERPT_CHARS] + "\n... [excerpt truncated]"
+        if snippet.strip():
+            excerpts.append({"file": rel, "content": snippet})
+    return excerpts
 
 
 def _build_complexity_context(session_id: str, outlier_files: list[str], db_path: Path) -> dict:

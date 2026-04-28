@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
+from typing import Optional
 
 import anthropic
 
@@ -692,15 +693,22 @@ def _load_file_contents(affected_files: list[str], target: Path) -> dict[str, st
 def _apply_diff(diff_text: str, target: Path) -> None:
     """Apply a unified diff produced by an LLM to the target directory.
 
-    LLM diffs routinely have three issues that defeat standard patch/git-apply:
+    LLM diffs routinely have issues that defeat standard patch/git-apply:
     1. Wrapped in ```diff ... ``` fences
     2. File paths carry a leading source-repo prefix (e.g. a/workspaces/ADDS/...)
        rather than being relative to the target root
     3. Hunk @@ line counts that are off by a few lines
+    4. Git quotes paths that contain spaces (e.g. "a/Original files/Foo.cs")
 
-    Strategy: reconstruct each file's new content from the diff's context (+)
-    and unchanged ( ) lines, stripping removed (-) lines. This is immune to
-    hunk-count errors and path-prefix confusion.
+    Strategy: reconstruct each file's new content from the diff's context (space)
+    and added (+) lines, stripping removed (-) lines. Three application modes:
+
+      - Modify in place (--- a/foo, +++ b/foo): write new content to foo.
+      - New file       (--- /dev/null, +++ b/foo): create foo with the + lines.
+      - Rename         (--- a/foo, +++ b/bar where foo != bar): write content
+                       to bar, delete foo.
+
+    This is immune to hunk-count errors and path-prefix confusion.
     """
     import re as _re
 
@@ -711,78 +719,120 @@ def _apply_diff(diff_text: str, target: Path) -> None:
 
     lines = text.splitlines()
 
-    # Parse into per-file hunks
-    # Collect (target_rel_path, list_of_hunk_lines) pairs
-    files: list[tuple[str, list[str]]] = []
-    cur_path: str | None = None
+    # Parse into per-file hunks. Each entry is (source_rel | None, dest_rel | None, hunk_lines)
+    # where source is None for new-file diffs (--- /dev/null) and dest is None
+    # for malformed entries we'll skip.
+    files: list[tuple[Optional[str], Optional[str], list[str]]] = []
+    cur_source: Optional[str] = None
+    cur_dest: Optional[str] = None
     cur_lines: list[str] = []
 
-    def _extract_path(header: str) -> str:
-        """Strip a/b prefix and any leading absolute path components."""
+    def _extract_path(header: str) -> Optional[str]:
+        """Returns None for /dev/null, else the relative path within target."""
         p = header.strip()
-        # Git quotes paths that contain spaces or unicode (e.g.
-        # "a/Original files/Foo.Cmd"). Strip the surrounding quotes before
-        # any other processing or every later check fails.
+        # Git quotes paths that contain spaces (e.g. "a/Original files/Foo.Cmd")
         if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
             p = p[1:-1]
+        if p == "/dev/null":
+            return None
         # Remove leading a/ or b/
         p = _re.sub(r"^[ab]/", "", p)
-        # If path still looks absolute or contains the source root, strip
-        # everything up to the first path component that exists in target
+        # Walk path components looking for one that exists in target. For
+        # NEW files this returns the as-is path (none of its prefixes exist
+        # yet but its parent directory should — we check that at apply time).
         parts = Path(p).parts
         for i in range(len(parts)):
             candidate = Path(*parts[i:])
             if (target / candidate).exists():
                 return str(candidate)
-        return p  # best effort
+        return p  # best effort — verify parent dir exists before writing
+
+    def _flush() -> None:
+        files.append((cur_source, cur_dest, cur_lines))
 
     i = 0
     while i < len(lines):
         line = lines[i]
         if line.startswith("--- "):
-            # Save previous file
-            if cur_path is not None:
-                files.append((cur_path, cur_lines))
+            # Save previous file before starting a new one
+            if cur_dest is not None or cur_source is not None:
+                _flush()
             cur_lines = []
-            cur_path = None
-            # Next line should be +++
+            raw_src = line[4:].split("\t")[0]
+            cur_source = _extract_path(raw_src)
+            cur_dest = None
             if i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
-                raw = lines[i + 1][4:].split("\t")[0]  # strip timestamp
-                cur_path = _extract_path(raw)
+                raw_dest = lines[i + 1][4:].split("\t")[0]
+                cur_dest = _extract_path(raw_dest)
                 i += 2
                 continue
         elif line.startswith("@@ "):
-            pass  # hunk header — just skip, we don't need line counts
-        elif cur_path is not None and not line.startswith("--- "):
+            pass  # hunk header — line counts aren't needed for our apply
+        elif cur_dest is not None or cur_source is not None:
             cur_lines.append(line)
         i += 1
 
-    if cur_path is not None:
-        files.append((cur_path, cur_lines))
+    if cur_dest is not None or cur_source is not None:
+        _flush()
 
     if not files:
-        return  # nothing to apply
+        return
 
-    for rel_path, hunk_lines in files:
-        dest = target / rel_path
-        if not dest.exists():
-            continue  # skip files not present in target
+    for src_rel, dest_rel, hunk_lines in files:
+        if dest_rel is None:
+            # +++ /dev/null — explicit file deletion. Remove the source file.
+            if src_rel and (target / src_rel).is_file():
+                try:
+                    (target / src_rel).unlink()
+                except OSError:
+                    pass
+            continue
 
-        # Rebuild new file content from context + added lines
+        # Rebuild new file content from added + context lines
         new_content_lines = []
         for ln in hunk_lines:
             if ln.startswith("+"):
                 new_content_lines.append(ln[1:])
             elif ln.startswith("-"):
-                pass  # removed line
+                pass  # removed line — drop it
             elif ln.startswith("@@ "):
-                pass  # hunk header inside lines list
+                pass  # hunk header buried in the lines list
             else:
-                # Context line (starts with space or is bare)
                 new_content_lines.append(ln[1:] if ln.startswith(" ") else ln)
 
-        if new_content_lines:
-            dest.write_text("\n".join(new_content_lines) + "\n", encoding="utf-8")
+        # Pure-deletion case: every line in the diff was removed and the dest
+        # is /dev/null. Treat as a delete of the source file.
+        if not new_content_lines:
+            if src_rel and (target / src_rel).is_file():
+                try:
+                    (target / src_rel).unlink()
+                except OSError:
+                    pass
+            continue
+
+        dest_path = target / dest_rel
+        # Safety: only write if either the dest already exists (modify case),
+        # the source exists (rename case), or the parent directory exists
+        # (new-file in known dir). This rejects writes into hallucinated
+        # paths from malformed diffs.
+        is_new_file = src_rel is None
+        is_modify_or_rename = src_rel is not None and (target / src_rel).exists()
+        parent_exists = dest_path.parent.exists()
+        if not (dest_path.exists() or is_modify_or_rename or (is_new_file and parent_exists)):
+            continue
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_text("\n".join(new_content_lines) + "\n", encoding="utf-8")
+
+        # Rename case: --- a/foo, +++ b/bar with foo != bar. We've written
+        # the new content; now remove the old file.
+        if (src_rel
+                and src_rel != dest_rel
+                and (target / src_rel).is_file()):
+            try:
+                (target / src_rel).unlink()
+            except OSError:
+                pass
 
 
 def _git_commit(target: Path, message: str) -> str | None:
