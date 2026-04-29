@@ -4,6 +4,46 @@ Append-only. Most recent at top.
 
 ---
 
+## [2026-04-29] application | First downstream consumer of the RAG pipeline — full ADDS modernization plan committed and Phases 1-5 executed (code-level)
+
+The 4-source hybrid + reranker RAG (per the prior log entry) was used to drive the discovery pass for an ADDS modernization plan, then the plan was executed end-to-end as far as a Linux Codespace permits.
+
+**Plan**: `wiki/project/adds-modernization-plan.md` (`ad9bd39`)
+- AutoCAD Map 3D 2025 / Oracle 19c / .NET 8 forced migration in 5 phases (~11 weeks)
+- 14-item ranked opportunity backlog post-shipping
+- Risk register; open questions block
+- RAG-derived current-state baseline table covering: solution artifacts, Oracle integration, AutoCAD API surface, LISP/C# interop, auth flow, threading, config, deployment chain, LISP scope, test infrastructure
+- Key strategic insight: separate **forced** changes (cannot ship without) from **opportunistic** ones; ship the forced minimum first
+
+**Notable RAG-derived findings used in the plan:**
+- ADDS does NOT use Map 3D's GIS APIs — only one commented-out `// using AcadGIS = Autodesk.Gis.Map;` in `jigs.cs`. Map 3D 2025 is just the runtime host
+- AutoCAD 2025 is the first version on .NET 8 — the framework upgrade is forced
+- Only ~7,500 LOC of C# but ~25,000+ LOC of AutoLISP (Utils.Lsp 12,802; Acad.Lsp 7,764; GET_INIT.LSP 3,240; Common.Lsp 362)
+- The famous "AES key" issue is `EncryptionKey = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"` + 13-byte salt `"Ivan Medvedev"` in `utilities.cs`
+- "UNC paths" are actually `MapDrive "M:", "alxapsb12", "Adds"` calls in VBS launchers — no literal `\\server\share` strings exist
+- `acdb17.dll` P/Invoke is pinning to AutoCAD 2007's database DLL by accident-of-history; needs `acdb25.dll` for AutoCAD 2025
+
+**Execution**: `BraPil/ADDS_modernized_run2` (`c5ea202`)
+- New top-level structure: `Updated Files/` (refactored codebase), `Documentation/` (phase records), `Original files/` (untouched baseline)
+- Phase 1 — SDK-style csproj at `net8.0-windows`; Oracle.ManagedDataAccess.Core 23.x replacing ODP.NET classic; `[SuppressUnmanagedCodeSecurity]` removed; `acdb17.dll` → `acdb25.dll`; `acedEvaluateLisp` mangled-name TODO marker for Phase 0 verification
+- Phase 2 — DPAPI Encrypt/Decrypt replacing hardcoded `EncryptionKey` + AES (with `LegacyDecrypt` shim for one-release migration); 4 priority SQL injection sites parameterized; `OracleConnectionStringBuilder` replacing concat; `using` on every disposable
+- Phase 3 — `Install-Adds.ps1` + `Uninstall-Adds.ps1` + `divisions.json` replace 9 VBS/Cmd files; per-user ACL on AddsTemp replaces overly broad `Users:(oi)(ci)f`
+- Phase 4 — `AddsConfig` typed access to `appsettings.template.json`; workspace switch in `adds.cs` converted to dictionary lookup
+- Phase 5 — `Adds.Tests` xUnit project + 3 test classes; GitHub Actions workflow with `build-and-test` + `powershell-syntax` jobs
+- 9 markdown documents under `Documentation/` recording per-phase changes, deferred items, and acceptance criteria
+- Single-source-of-truth `deferred-validation.md` enumerates every item that requires Windows + AutoCAD 2025 + Oracle 19c to acceptance-test
+
+**Honest scope statement**: this Codespace pass produced all the code-level transformations and authoring work. It explicitly cannot validate `dotnet build` against AutoCAD assemblies, Oracle 19c connectivity, the new `acedEvaluateLisp` mangled name, AutoCAD NETLOAD, or the PowerShell installer end-to-end — those require a Windows + AutoCAD 2025 + Oracle 19c workstation. Every such item is enumerated in `Documentation/deferred-validation.md` in the modernized repo.
+
+**Pages added**:
+- `wiki/project/adds-modernization-plan.md`
+
+**Pages updated**:
+- `wiki/index.md` (count → 16)
+- `wiki/log.md` (this entry)
+
+---
+
 ## [2026-04-29] ingest | RAG retrieval evolved from vector-only → 4-source hybrid + reranker; probe scorecard 7/7 ✅
 
 Probe-driven iteration on `scripts/rag_query.py` after the 2026-04-28 RAG layer revealed several blind spots. Designed a 7-question probe set covering single-file-type, sparse-content, cross-cutting, comparative, dense-token, exact-symbol, and synthesis queries. Iterated until all 7 surface the right evidence.

@@ -2,7 +2,7 @@
 
 > **Status**: current
 > **Last updated**: 2026-04-29
-> **Tags**: operations, runbook, regression-checklist, lessons-learned
+> **Tags**: operations, runbook, regression-checklist, lessons-learned, modernization-planning
 
 End-to-end recipe for running ALARMv3 against a new legacy codebase from scratch, with a pre-flight checklist that encodes every silent-failure path we've hit so far. Designed so the next codebase (BillGen) starts at the quality level the ADDS full-archive run finished at — not at the empty-findings starting line we hit on 2026-04-28.
 
@@ -379,7 +379,57 @@ Use the trace to debug ranking surprises: if a chunk you expected isn't in top_k
 
 ---
 
-## 7. BillGen-specific notes (TODO when starting)
+## 7. Driving a modernization plan from RAG output (validated 2026-04-29)
+
+The RAG layer is also useful as the discovery surface for downstream
+modernization planning. The pattern that worked for ADDS:
+
+1. **Read the .csproj / .sln / app.config directly** before RAG — these
+   are tiny and faster than RAG. Capture the framework version, NuGet
+   state (or absence), reference paths, and source-control bindings.
+2. **Run 8-12 targeted RAG queries** with `--rerank` covering the
+   runtime patterns that .csproj alone doesn't reveal:
+   - Database integration (driver, query construction, parameter use)
+   - Plugin host API surface (managed namespaces, P/Invoke entries)
+   - Cross-language interop (e.g. LISP/C# bridge in ADDS)
+   - UI patterns (form lifecycle, data binding, modal usage)
+   - Authentication and credential storage end-to-end
+   - Threading and async patterns
+   - Configuration loading (config files, hardcoded paths)
+   - Deployment / install chain
+   - Plugin entry point and command registration
+   - LISP/secondary-language scope (file count, line counts, ownership)
+   - Test infrastructure (frameworks, fixtures)
+3. **Pull the existing recommendation table from the deep-analysis run**
+   via `SELECT id, title, severity, effort, rationale FROM
+   recommendation ORDER BY rank LIMIT 20` — this is the
+   adversarially-evaluated ranked finding list. Use it as a sanity
+   check for the plan's scope, not as the plan itself.
+4. **Produce a four-section plan**:
+   - Current state baseline (factual table; RAG-cited)
+   - Target state table
+   - **Forced vs optional changes** — the central strategic insight
+     that prevents the migration from becoming a rewrite
+   - Phased plan with per-phase deliverables, acceptance criteria,
+     and an open-questions block
+
+The first ADDS-modernization plan landed at
+[`project/adds-modernization-plan.md`](../project/adds-modernization-plan.md).
+That plan + the executed code-level migration in
+`BraPil/ADDS_modernized_run2` is the canonical example to copy from
+when planning the next codebase (BillGen).
+
+**Honest scope statement is mandatory.** A code-level migration
+performed in a Linux Codespace cannot build against AutoCAD managed
+assemblies, cannot reach Oracle, and cannot validate any
+plugin-host-bound code path. The modernization repo's
+`Documentation/deferred-validation.md` enumerates every such item.
+**Do not declare a migration shipped until every box in that file is
+checked.**
+
+---
+
+## 8. BillGen-specific notes (TODO when starting)
 
 This section is empty until the first BillGen run. Planned additions:
 - Domain summary (one paragraph — what BillGen does, sourced from code or docs)
@@ -392,4 +442,5 @@ This section is empty until the first BillGen run. Planned additions:
 - [SCHEMA.md](../SCHEMA.md) — wiki conventions
 - [project/phase1-implementation.md](../project/phase1-implementation.md) — engine internals
 - [project/phase2-plan.md](../project/phase2-plan.md) — RAG layer design
+- [project/adds-modernization-plan.md](../project/adds-modernization-plan.md) — the first downstream consumer of the RAG; validated planning template for legacy-codebase modernization
 - [tools/ollama-codespaces.md](../tools/ollama-codespaces.md) — Ollama setup
