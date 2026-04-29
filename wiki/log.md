@@ -4,6 +4,28 @@ Append-only. Most recent at top.
 
 ---
 
+## [2026-04-28] ingest | Full-archive ADDS run continuation — 5 silent-failure paths fixed, RAG validated end-to-end
+
+Continued the 2026-04-28 ADDS full-archive run after observing only 16 of an expected ~20 recommendations and 14 of 16 changes committing in the morning batch. Diagnosis: five silent-failure paths in the engine, all now fixed.
+
+**Bugs found and fixed in commit `90c6a9a`:**
+1. **Path-convention split** — `core/analysis.py` (csharp/python/js tree-sitter) wrote absolute paths to `symbol`/`complexity_metric`/`dependency_edge`/`code_chunk` while `core/language_researcher.py` wrote relative paths. Result: 49 csharp + 8 javascript files were silently dropped from every relative-path query, including the representative-file selector in `deep_analysis`. Fix: writers normalize to `manifest.relative_path` form; one-shot `scripts/migrate_paths_to_relative.py` for existing DBs.
+2. **Token-cap truncation** — `_MAX_TOKENS_SUBSYSTEM=2048` truncated 10-finding responses; the naïve `[`..`]` JSON slicer returned `[]`. Fix: cap raised to 6144 and `_parse_findings` walks the array recovering complete `{}` objects.
+3. **Source-excerpt presentation** — original prompt JSON-encoded source code, escaping every newline. Fix: `_format_subsystem_message` puts each rep file in a fenced code block. Findings density 0–9 per cluster → 10/10 per cluster.
+4. **Body-only diff applicator** — `_apply_diff` rebuilt files from hunk lines alone, dropping out-of-hunk content. Fix: `_splice_hunks` fuzzy-locates each hunk and splices in place.
+5. **Missing evaluation_report writer** — added `ArtifactWriter.write_evaluation_report_md`.
+
+**Bug found and fixed post-`90c6a9a`:**
+6. **Symbol-sparse files invisible to RAG** — `Upd_S_Map_AddsW10_Trans_Test_Local.Cmd` had 3 GOTO-label "function" symbols at lines 6/10/81; chunker counted that as "has symbols" and skipped the file_overview emit. The file's actual Xcopy/icacls body was not retrievable. Fix: `_create_chunks` now emits a `file_overview` chunk (up to 200 lines) for **every** eligible file regardless of symbol presence.
+
+**Run results post-fix:** 50 raw findings (was 16) across 5 subsystems → 20 ranked recommendations (was 16); adversarial verdicts 8 accept / 11 revise / 1 reject; subsystems 0/1/2 (110 LISP / 66 C# / 51 LookUpTable) now produce 10/10 findings each (previously empty). RAG validated end-to-end on three real questions including SQL injection localisation, Oracle login flow, and a deploy-script question that exposed the file_overview bug.
+
+**Pages added:** runbooks/full-archive-run.md (the consolidated lessons-learned + pre-flight checklist for the next codebase, e.g. BillGen).
+
+**Pages updated:** index.md (+1 page, count 15), log.md (this entry).
+
+---
+
 ## [2026-04-20] ingest | Phase 4 implementation complete
 Phase 4 shipped: implementation.py (plan/build/eval pipeline, git commit to TARGET), implementation_plan + implementation_change DB tables, 5 new MCP tools (plan_implementation, clone_for_implementation, implement_next, accept_change, reject_change), 2 new resources (implementation://plan, implementation://changes). 190 tests passing.
 Board consulted via AAA (Cole Medin + consensus + architecture recommendation) before implementation. Key decisions: git worktree clone for isolation, context discipline (load only affected files), human gate before every commit, retry-with-feedback loop on rejection.

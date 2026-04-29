@@ -1,6 +1,6 @@
 # ALARMv3 Wiki Index
 
-Last updated: 2026-04-20 | Pages: 14
+Last updated: 2026-04-28 | Pages: 15
 
 ## Project
 
@@ -31,3 +31,7 @@ Last updated: 2026-04-20 | Pages: 14
 ## Tools
 
 - [Ollama in Codespaces](tools/ollama-codespaces.md) — Running nomic-embed-text on CPU in GitHub Codespaces; devcontainer setup
+
+## Runbooks
+
+- [Full-archive run](runbooks/full-archive-run.md) — Pre-flight checklist, engine settings to verify, post-run sanity checks, known silent-failure paths, RAG querying patterns. Read before starting any new codebase (e.g. BillGen).

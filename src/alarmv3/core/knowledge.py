@@ -128,8 +128,34 @@ class KnowledgeBuilder:
 
     # ── Chunking ────────────────────────────────────────────────────────────
 
+    # Per-file overview chunk size. Tuned to capture the body of typical legacy
+    # files (.Cmd batch scripts, .lsp utilities, AutoLISP user scripts) that
+    # have only a handful of small inferred symbols and would otherwise leave
+    # their actual logic invisible to the RAG layer.
+    _OVERVIEW_LINES = 200
+
     def _create_chunks(self, conn: sqlite3.Connection) -> int:
-        """Create code_chunk rows from symbols + file headers. Returns count created."""
+        """Create code_chunk rows from symbols + per-file overviews. Returns count.
+
+        Two complementary chunk families are emitted:
+
+          1. Structure-aware chunks — one per extracted symbol that has a known
+             line range. These are the precise units the LLM reasons about for
+             "what does function X do?" queries.
+
+          2. File-overview chunks — one per eligible file covering lines
+             1..min(N, _OVERVIEW_LINES). These guarantee the file's body is
+             retrievable for "how does this file work?" queries even when the
+             symbol extractor only found a handful of label/header lines (the
+             common case for batch scripts, AutoLISP utilities with sparse
+             defun coverage, .atc/.xtp config files, etc.).
+
+        Originally the overview chunk was emitted only for files with zero
+        symbols, but on the ADDS run that left the .Cmd deploy scripts
+        invisible to RAG (they had 3 GOTO-label "function" symbols at lines
+        6/10/81 which qualified them as "has symbols" but failed to capture
+        the Xcopy/icacls body in between).
+        """
         sid = self._session.session_id
         source_root = self._session.source_path
         created = 0
@@ -140,7 +166,7 @@ class KnowledgeBuilder:
                 return p
             return str(source_root / p)
 
-        # Structure-aware chunks: one per symbol with known line range
+        # 1. Structure-aware symbol chunks.
         symbols = conn.execute(
             """
             SELECT s.file_path, s.name, s.symbol_type, s.start_line, s.end_line
@@ -173,25 +199,24 @@ class KnowledgeBuilder:
             )
             created += 1
 
-        # File-header chunks: imports + first N lines for files with no symbols.
-        # The symbol table is keyed by relative path; manifest exposes both
-        # absolute (file_path) and relative (relative_path), so use the
-        # relative form for storage and resolve to absolute for reading.
-        files_with_symbols = {s["file_path"] for s in symbols}
+        # 2. File-overview chunk for every eligible file. The symbol table is
+        # keyed by relative path; manifest exposes both absolute (file_path)
+        # and relative (relative_path), so use the relative form for storage
+        # and resolve to absolute for reading.
         eligible = conn.execute(
-            "SELECT file_path, relative_path FROM manifest WHERE session_id=? AND is_eligible=1",
+            "SELECT file_path, relative_path, line_count FROM manifest "
+            "WHERE session_id=? AND is_eligible=1",
             (sid,),
         ).fetchall()
 
         for row in eligible:
             rel_fp = row["relative_path"] or row["file_path"]
             abs_fp = row["file_path"] or rel_fp
-            if rel_fp in files_with_symbols:
-                continue
-            content = _slice_file(abs_fp, 1, 40)
-            if not content:
-                continue
             if self._chunk_exists(conn, rel_fp, 1):
+                continue
+            end_line = min(row["line_count"] or self._OVERVIEW_LINES, self._OVERVIEW_LINES)
+            content = _slice_file(abs_fp, 1, end_line)
+            if not content:
                 continue
             h = hashlib.sha256(content.encode()).hexdigest()
             conn.execute(
@@ -201,7 +226,7 @@ class KnowledgeBuilder:
                  start_line, end_line, content, content_hash, token_count, embedded)
                 VALUES (?,?,?,?,?,?,?,?,?,0)
                 """,
-                (sid, rel_fp, "file_header", None, 1, 40, content, h, _approx_tokens(content)),
+                (sid, rel_fp, "file_overview", None, 1, end_line, content, h, _approx_tokens(content)),
             )
             created += 1
 

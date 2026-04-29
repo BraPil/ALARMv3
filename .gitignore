@@ -60,3 +60,6 @@ htmlcov/
 
 # ALARMv3 runtime artifacts (sessions, analysis DBs, audit logs)
 .alarmv3/
+
+# Claude Code local agent state (settings.local.json, scheduled_tasks.lock)
+.claude/

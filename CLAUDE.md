@@ -86,6 +86,16 @@ deterministic: file discovery, AST parsing, dependency graph, complexity metrics
 LLM-powered:   architecture pattern recognition, recommendations text, risk narrative
 ```
 
+## Path-convention rule — load-bearing, do not violate
+
+Every per-file table (`symbol`, `complexity_metric`, `dependency_edge`, `code_chunk`, `analysis_coverage`) MUST store paths in `manifest.relative_path` form. Tree-sitter, regex fallback, language_researcher, chunker — all writers normalise to relative paths before insert.
+
+A single writer that leaks `str(absolute_path)` silently drops every row from downstream queries that join on the partitioner's relative path. That bug erased 49 csharp + 8 javascript files from the 2026-04-28 ADDS run despite their symbols being on disk. See `wiki/runbooks/full-archive-run.md` §4.1.
+
+Quick audit: `SELECT COUNT(*) FROM symbol WHERE file_path LIKE '/%'` MUST return 0. Same for `complexity_metric`, `dependency_edge.source_file`, `code_chunk.file_path`.
+
+If you add a new writer, the helper is `Analyzer._to_relative(abs_path)`. Use it before every insert.
+
 ## Language support (Phase 1)
 
 | Language | Parser | Priority | Notes |
