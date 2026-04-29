@@ -9,6 +9,7 @@ Python is compiled without enable_load_extension support.
 """
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -230,7 +231,128 @@ class KnowledgeBuilder:
             )
             created += 1
 
+        # 3. Secret-pattern chunks — short, dense, focused on credential /
+        #    key / network-share content. Surface for queries phrased in
+        #    natural language ("hardcoded credentials", "UNC paths") that
+        #    don't lexically match the surrounding function body.
+        created += self._extract_secret_chunks(conn, eligible)
+
         conn.commit()
+        return created
+
+    # Patterns that mark a line as security-relevant. Each entry is
+    # (label, compiled_regex). Labels become the chunk's symbol_name so the
+    # type is discoverable from chunk metadata. Patterns are intentionally
+    # conservative — false positives are cheap (extra chunks), false
+    # negatives invisible (security findings missed).
+    _SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
+        # AES/key/IV/salt byte-array literals — 8+ hex bytes in `new byte[]`
+        # initializer. Lower threshold catches typical PBKDF2 salts (8-13
+        # bytes) and short symmetric keys.
+        ("aes_byte_array", re.compile(
+            r"new\s+byte\s*\[\s*\]\s*\{(?:[^}]*?(?:0x[0-9a-fA-F]{1,2}\s*,\s*){8,})",
+            re.IGNORECASE,
+        )),
+        # ADO.NET / ODBC connection strings — at least one key=value pair
+        # using a known connection-string keyword.
+        ("connection_string", re.compile(
+            r"\b(?:Data\s+Source|Initial\s+Catalog|User\s+(?:ID|Id)|"
+            r"Provider|Trusted_Connection|Integrated\s+Security)\s*=",
+            re.IGNORECASE,
+        )),
+        # Variable names that scream "secret" assigned to a string literal.
+        # Matches `password = "..."`, `EncryptionKey = "..."`, `apiKey="..."`,
+        # etc. Includes crypto-material names (key/IV/salt) that are common
+        # markers of hardcoded cryptographic constants.
+        ("credential_assignment", re.compile(
+            r"\b(?:password|passwd|pwd|secret|"
+            r"(?:api|access|auth|private|client|encryption|encrypt|decrypt|"
+            r"crypto|cipher|hash|signing|sign|master)[-_]?(?:key|secret|token)|"
+            r"(?:init[-_]?vector|init[-_]?vec|salt))"
+            r"\b\s*[:=]\s*['\"][^'\"]+['\"]",
+            re.IGNORECASE,
+        )),
+        # MapDrive-style network mount calls — `MapDrive "M:", "server",
+        # "share"`. The semantic equivalent of a UNC literal in legacy VBS
+        # launchers; surfaces the server/share names without needing the
+        # `\\` syntax.
+        ("network_share_call", re.compile(
+            r'\bMap(?:Network)?Drive\s*\(?\s*"[A-Za-z]:"\s*,\s*"[\w.-]+"\s*,\s*"[\w.-]+"',
+            re.IGNORECASE,
+        )),
+        # AWS access key id — a fixed format, very low false-positive rate.
+        ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+        # JWT — three base64url segments separated by dots, starting with
+        # the `eyJ` header marker.
+        ("jwt_token", re.compile(
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
+        )),
+        # URL with embedded basic auth — the colon-at form leaks creds in
+        # the URL itself.
+        ("auth_url", re.compile(r"https?://[^/\s\"']+:[^@\s\"']+@")),
+    ]
+
+    # Lines of context around each match to capture variable names,
+    # function context, and surrounding usage. Tuned so a chunk with
+    # `_aesKey = new byte[] {` 5 lines above the byte literals still
+    # captures the variable name.
+    _SECRET_CONTEXT_BEFORE = 5
+    _SECRET_CONTEXT_AFTER = 5
+
+    def _extract_secret_chunks(
+        self, conn: sqlite3.Connection, eligible: list[sqlite3.Row]
+    ) -> int:
+        """Emit chunk_type='secret_pattern' chunks for credential/key/UNC matches.
+
+        Each match line gets one chunk covering match_line ± context. Multiple
+        patterns matching the same line are collapsed into one chunk with all
+        labels joined as the symbol_name.
+        """
+        sid = self._session.session_id
+        created = 0
+
+        for row in eligible:
+            rel_fp = row["relative_path"] or row["file_path"]
+            abs_fp = row["file_path"] or rel_fp
+            try:
+                text = Path(abs_fp).read_text(errors="replace")
+            except (OSError, PermissionError):
+                continue
+            lines = text.splitlines()
+            if not lines:
+                continue
+
+            # match_line (1-indexed) → set of pattern labels
+            hits: dict[int, set[str]] = {}
+            for label, pat in self._SECRET_PATTERNS:
+                for m in pat.finditer(text):
+                    line_num = text.count("\n", 0, m.start()) + 1
+                    hits.setdefault(line_num, set()).add(label)
+
+            for line_num in sorted(hits):
+                # Avoid colliding with file_overview chunk at start_line=1.
+                start = max(2, line_num - self._SECRET_CONTEXT_BEFORE)
+                end = min(len(lines), line_num + self._SECRET_CONTEXT_AFTER)
+                content = "\n".join(lines[start - 1: end]).strip()
+                if not content:
+                    continue
+                if self._chunk_exists(conn, rel_fp, start):
+                    continue
+                symbol_name = "+".join(sorted(hits[line_num]))
+                h = hashlib.sha256(content.encode()).hexdigest()
+                conn.execute(
+                    """
+                    INSERT INTO code_chunk
+                    (session_id, file_path, chunk_type, symbol_name,
+                     start_line, end_line, content, content_hash,
+                     token_count, embedded)
+                    VALUES (?,?,?,?,?,?,?,?,?,0)
+                    """,
+                    (sid, rel_fp, "secret_pattern", symbol_name,
+                     start, end, content, h, _approx_tokens(content)),
+                )
+                created += 1
+
         return created
 
     def _chunk_exists(self, conn: sqlite3.Connection, file_path: str, start_line: int) -> bool:

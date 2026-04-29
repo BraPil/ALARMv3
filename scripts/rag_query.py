@@ -143,9 +143,17 @@ def retrieve_keyword(db_path: Path, query: str, top_k: int = 8) -> list[dict]:
             )
             """
         )
+        # Index chunk_type + symbol_name + content together so metadata
+        # tokens (e.g. "credential_assignment", "network_share_call",
+        # "function MyLoginObj") let security-themed and symbol-named
+        # queries match the right chunks lexically.
         conn.execute(
             "INSERT INTO temp.chunks_fts(chunk_id, content) "
-            "SELECT id, content FROM main.code_chunk"
+            "SELECT id, "
+            "  COALESCE(chunk_type,'') || ' ' || "
+            "  COALESCE(symbol_name,'') || ' ' || "
+            "  COALESCE(content,'') "
+            "FROM main.code_chunk"
         )
         rows = conn.execute(
             """
@@ -278,6 +286,84 @@ def _extract_path_constraints(query: str, db_path: Path) -> list[str]:
     return patterns
 
 
+# Query keywords that indicate the user is asking about security-sensitive
+# content. When detected, we run a `secret_pattern`-typed retrieval source
+# so the chunker's secret-extraction work is not drowned by surrounding
+# code. The set is intentionally a mix of crypto/auth and network-share
+# vocabulary — the same `secret_pattern` chunks cover both because the
+# chunker emits crypto AND network_share_call chunks under that type.
+_SECRET_QUERY_KEYWORDS = {
+    "credential", "credentials", "password", "passwords",
+    "secret", "secrets", "token", "tokens",
+    "api key", "api-key", "apikey", "access key", "auth token",
+    "encryption", "encrypt", "decrypt", "cipher",
+    "salt", "init vector", "iv ", "private key", "signing key",
+    "connection string", "connection strings",
+    "network share", "network shares", "unc path", "unc paths",
+    "smb share", "drive mapping", "mapped drive", "map drive",
+    "hardcoded",
+}
+
+
+def _is_secret_query(query: str) -> bool:
+    q = query.lower()
+    return any(kw in q for kw in _SECRET_QUERY_KEYWORDS)
+
+
+def retrieve_typed(
+    db_path: Path, query: str, top_k: int, chunk_type: str
+) -> list[dict]:
+    """BM25 over chunks restricted to a single chunk_type, scored over
+    chunk_type + symbol_name + content.
+
+    Used to surface `secret_pattern` chunks for credential/network queries
+    without competing against the much larger pool of function/file_overview
+    chunks. When the query phrasing doesn't lexically match crypto code
+    (e.g. "where are passwords?" vs. an `EncryptionKey =` line), the small
+    type-restricted pool keeps the secret chunks visible.
+    """
+    fts_q = _fts_query(query)
+    if not fts_q:
+        return []
+    conn = _vec_conn(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE temp.chunks_fts_typed USING fts5(
+                content,
+                chunk_id UNINDEXED,
+                tokenize='unicode61 remove_diacritics 2'
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO temp.chunks_fts_typed(chunk_id, content) "
+            "SELECT id, "
+            "  COALESCE(chunk_type,'') || ' ' || "
+            "  COALESCE(symbol_name,'') || ' ' || "
+            "  COALESCE(content,'') "
+            "FROM main.code_chunk WHERE chunk_type=?",
+            [chunk_type],
+        )
+        rows = conn.execute(
+            """
+            SELECT
+                c.id, c.chunk_type, c.symbol_name,
+                c.file_path, c.start_line, c.end_line, c.content,
+                bm25(chunks_fts_typed) AS score
+            FROM chunks_fts_typed
+            JOIN main.code_chunk c ON c.id = chunks_fts_typed.chunk_id
+            WHERE chunks_fts_typed MATCH ?
+            ORDER BY bm25(chunks_fts_typed)
+            LIMIT ?
+            """,
+            [fts_q, top_k],
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
 def retrieve_path_filtered(
     db_path: Path, query: str, top_k: int, patterns: list[str]
 ) -> list[dict]:
@@ -307,9 +393,16 @@ def retrieve_path_filtered(
                 )
                 """
             )
+            # Same metadata-aware indexing as retrieve_keyword: include
+            # chunk_type and symbol_name so e.g. "credential_assignment"
+            # tokens are searchable.
             conn.execute(
                 f"INSERT INTO temp.chunks_fts_pf(chunk_id, content) "
-                f"SELECT id, content FROM main.code_chunk WHERE {where_clauses}",
+                f"SELECT id, "
+                f"  COALESCE(chunk_type,'') || ' ' || "
+                f"  COALESCE(symbol_name,'') || ' ' || "
+                f"  COALESCE(content,'') "
+                f"FROM main.code_chunk WHERE {where_clauses}",
                 patterns,
             )
             rows = conn.execute(
@@ -387,6 +480,15 @@ def retrieve(
                     db_path, query, n, patterns
                 )
                 weights["path"] = 2.0
+            # Secret-typed source: when the query asks about credentials /
+            # network shares / crypto, also pull from the small pool of
+            # secret_pattern chunks. Same path-aware flag controls it
+            # since both are query-intent-based filters.
+            if _is_secret_query(query):
+                sources_lists["secret"] = retrieve_typed(
+                    db_path, query, n, "secret_pattern"
+                )
+                weights["secret"] = 2.0
         fused = fuse_rrf(sources_lists, top_k, weights=weights)
 
         # Coverage guarantee: when multiple distinct path patterns are
