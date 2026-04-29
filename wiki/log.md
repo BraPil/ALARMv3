@@ -4,6 +4,38 @@ Append-only. Most recent at top.
 
 ---
 
+## [2026-04-29] ingest | RAG retrieval evolved from vector-only → 4-source hybrid + reranker; probe scorecard 7/7 ✅
+
+Probe-driven iteration on `scripts/rag_query.py` after the 2026-04-28 RAG layer revealed several blind spots. Designed a 7-question probe set covering single-file-type, sparse-content, cross-cutting, comparative, dense-token, exact-symbol, and synthesis queries. Iterated until all 7 surface the right evidence.
+
+**Commits in order:**
+1. **`540b6bb`** — initial `scripts/rag_query.py` (vector-only via Ollama nomic-embed-text → sqlite-vec → Claude with citations).
+2. **`0a2d0c0`** — chunker emits `file_overview` for **every** eligible file (was: only files with zero symbols), so symbol-sparse files like `.Cmd` deploy scripts have their bodies indexed. Plus `scripts/rechunk_session.py` for incremental upgrades.
+3. **`df9d61c`** — hybrid retrieval. BM25 over an in-memory FTS5 index fused with vector via standard Reciprocal Rank Fusion (k=60). `--mode {vector,keyword,hybrid}` with hybrid as default. Closes the embedder-blind-spot for batch/shell content (was rank ~925/2501, now mid-tier).
+4. **`0e435e8`** — path-aware retrieval. Third source filtered by `file_path LIKE` patterns extracted at runtime: file extensions via regex, distinctive directory segments (length ≥ 5 or containing a digit) pulled from the manifest. When multiple patterns are detected, top-N per pattern is interleaved and `_ensure_pattern_coverage()` force-includes the per-pattern top-1 if RRF didn't surface it. Path-source weight=2.0.
+5. **`80ed18b`** — `secret_pattern` chunker. Short context-windowed (line ± 5) chunks for AES byte arrays, ADO.NET connection strings, credential variable assignments, MapDrive network mounts, AWS keys, JWTs, basic-auth URLs. FTS5 now indexes `chunk_type + symbol_name + content` so metadata tokens like `credential_assignment` participate in BM25. New `secret` retrieval source auto-fires when the query mentions security keywords. `scripts/add_secret_chunks.py` runs only this extraction step (~20-50 chunks instead of the full ~2500-chunk re-embed).
+6. **`bbb08b8`** — opt-in `--rerank` flag. Sends top-N candidates to Claude Haiku 4.5 with a structured 0-100 relevance scoring prompt. Default off (each call adds ~$0.005 + 1-2s). Failure-safe: any API error or malformed output falls back to RRF order. Closes the last ⚠️ (vector pollution on short single-symbol queries).
+
+**Bug worth recording:** when the draft `unc_path` regex was first added to the secret patterns, it matched 800 LISP-escaped local paths like `"C:\\Data\\file.txt"` and produced massive false positives. Removed in favor of `network_share_call` matching `MapDrive "M:", "server", "share"` — the actual idiom in legacy VBS launchers. If a future codebase has literal `\\server\share` strings, add the pattern back with a lookbehind: `(?<=["'\s])\\{2,4}[a-zA-Z][\w-]+\\{1,2}[\w.$-]+`.
+
+**Bug worth recording:** the reranker prompt builder used `str.format()`, which raised `ValueError: Single '}' encountered` on chunks containing literal `{}` (C# `new byte[] { 0x49, ... }`, JSON, dict literals). Fixed: use f-strings, never `.format()`, when chunk content is interpolated.
+
+**Probe scorecard journey:**
+
+| Probe | Vector | + Hybrid | + Path | + Secret | + Rerank |
+|---|---|---|---|---|---|
+| 1 (`.vbs` scripts exist) | ❌ | ❌ | ✅ | ✅ | ✅ |
+| 2 (hardcoded credentials) | ⚠️ | ⚠️ | ⚠️ | ✅ | ✅ |
+| 3 (error handling) | ✅ | ✅ | ✅ | ✅ | ✅ better |
+| 4 (19.0 vs Div_Map) | ❌ | ❌ | ✅ | ✅ | ✅ better |
+| 5 (UNC / network shares) | ⚠️ | ⚠️ | ⚠️ | ✅ | ✅ |
+| 6 (`What does C:MakXCopFils do?`) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ✅ |
+| 7 (highest-severity risks) | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+**Pages updated:** runbooks/full-archive-run.md (4 new silent-failure entries 4.6–4.9; section 5 rewritten with the new pipeline overview, trace tags, expanded seed queries; broken cross-repo memory link replaced with inline guidance), log.md (this entry), index.md (date bumped).
+
+---
+
 ## [2026-04-28] ingest | Full-archive ADDS run continuation — 5 silent-failure paths fixed, RAG validated end-to-end
 
 Continued the 2026-04-28 ADDS full-archive run after observing only 16 of an expected ~20 recommendations and 14 of 16 changes committing in the morning batch. Diagnosis: five silent-failure paths in the engine, all now fixed.
