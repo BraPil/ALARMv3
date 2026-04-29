@@ -167,34 +167,35 @@ def retrieve_keyword(db_path: Path, query: str, top_k: int = 8) -> list[dict]:
 
 
 def fuse_rrf(
-    vec_results: list[dict],
-    kw_results: list[dict],
+    sources_lists: dict[str, list[dict]],
     top_k: int,
     k_const: int = 60,
+    weights: dict[str, float] | None = None,
 ) -> list[dict]:
-    """Reciprocal Rank Fusion of two ranked lists.
+    """Weighted Reciprocal Rank Fusion of N ranked lists.
 
-    Score per chunk = sum(1 / (k_const + rank_in_each_list)). Standard k=60
-    from Cormack et al. 2009 — small enough that top ranks dominate, large
-    enough that mid-rank agreement still matters.
+    Score per chunk = sum(weight_i / (k_const + rank_in_list_i)). Standard
+    k=60 from Cormack et al. 2009. Default weight=1 per source.
+
+    Path-source weight is bumped to 2.0 because path-filtered hits represent
+    a user-explicit constraint ("the .vbs files I asked about"); single-source
+    rank-1 in path should outrank mid-rank cross-agreement in vec+kw, which
+    raw RRF would otherwise let win.
     """
+    weights = weights or {}
     fused: dict[int, float] = {}
     by_id: dict[int, dict] = {}
     sources: dict[int, set[str]] = {}
     ranks: dict[int, dict[str, int]] = {}
 
-    for rank, r in enumerate(vec_results, start=1):
-        cid = r["id"]
-        fused[cid] = fused.get(cid, 0.0) + 1.0 / (k_const + rank)
-        by_id[cid] = r
-        sources.setdefault(cid, set()).add("vec")
-        ranks.setdefault(cid, {})["vec"] = rank
-    for rank, r in enumerate(kw_results, start=1):
-        cid = r["id"]
-        fused[cid] = fused.get(cid, 0.0) + 1.0 / (k_const + rank)
-        by_id.setdefault(cid, r)
-        sources.setdefault(cid, set()).add("kw")
-        ranks.setdefault(cid, {})["kw"] = rank
+    for src_name, results in sources_lists.items():
+        w = weights.get(src_name, 1.0)
+        for rank, r in enumerate(results, start=1):
+            cid = r["id"]
+            fused[cid] = fused.get(cid, 0.0) + w / (k_const + rank)
+            by_id.setdefault(cid, r)
+            sources.setdefault(cid, set()).add(src_name)
+            ranks.setdefault(cid, {})[src_name] = rank
 
     ordered = sorted(fused.items(), key=lambda kv: -kv[1])
     out: list[dict] = []
@@ -207,23 +208,279 @@ def fuse_rrf(
     return out
 
 
+# Extension aliases: query-side regex → canonical extension stored in file_path.
+# Match either ".ext" verbatim, common synonyms (vbscript, autolisp), or
+# "<ext> file/script/code" patterns. Case-insensitive on the query side; the
+# resulting LIKE pattern preserves the case the chunker stored.
+_EXT_PATTERNS: list[tuple[str, list[str]]] = [
+    (".vbs", [r"\.vbs\b", r"\bvbscript\b", r"\bvbs\s+(?:file|script|code)"]),
+    (".cs",  [r"\.cs\b", r"\bc#", r"\bcsharp\b", r"\bcs\s+(?:file|code)"]),
+    (".lsp", [r"\.lsp\b", r"\blsp\b", r"\blisp\b", r"\bautolisp\b", r"\bvlx\b"]),
+    (".Lsp", [r"\.lsp\b", r"\blsp\b", r"\blisp\b", r"\bautolisp\b", r"\bvlx\b"]),
+    (".LSP", [r"\.lsp\b", r"\blsp\b", r"\blisp\b", r"\bautolisp\b", r"\bvlx\b"]),
+    (".Cmd", [r"\.cmd\b", r"\bbatch\s+(?:file|script)", r"\bcmd\s+(?:file|script)"]),
+    (".sln", [r"\.sln\b", r"\bsolution\s+file"]),
+    (".js",  [r"\.js\b", r"\bjavascript\b"]),
+    (".ini", [r"\.ini\b"]),
+    (".prv", [r"\.prv\b"]),
+]
+
+# Path segments to skip — too generic to be useful constraints.
+_PATH_STOP = {
+    "Original files", "Adds", "Common", "Lisp", "User", "Forms",
+    "Archive", "Utils", "Menu", "Template", "Support",
+}
+
+
+def _path_segments(db_path: Path) -> set[str]:
+    """Distinctive directory-segment strings from the index's file_paths.
+
+    "Distinctive" = length >= 5 OR contains a digit (catches '19.0'). Generic
+    segments like 'Common', 'Adds' are excluded — they would false-match
+    almost any natural-language query.
+    """
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    try:
+        rows = conn.execute("SELECT DISTINCT file_path FROM code_chunk").fetchall()
+    finally:
+        conn.close()
+    segs: set[str] = set()
+    for (fp,) in rows:
+        for seg in fp.split("/"):
+            if not seg or seg in _PATH_STOP:
+                continue
+            if len(seg) >= 5 or any(c.isdigit() for c in seg):
+                segs.add(seg)
+    return segs
+
+
+def _extract_path_constraints(query: str, db_path: Path) -> list[str]:
+    """Detect file-type and path-prefix mentions; return SQL LIKE patterns.
+
+    Empty list = no constraint detected (caller should skip path-filtered
+    retrieval). Multiple patterns are OR'd by the caller.
+    """
+    patterns: list[str] = []
+    q_lower = query.lower()
+
+    seen_exts: set[str] = set()
+    for ext, regexes in _EXT_PATTERNS:
+        if ext.lower() in seen_exts:
+            continue  # don't double-add (.lsp/.Lsp/.LSP are case variants)
+        if any(re.search(rx, q_lower) for rx in regexes):
+            patterns.append(f"%{ext}")
+            seen_exts.add(ext.lower())
+
+    for seg in _path_segments(db_path):
+        if seg.lower() in q_lower:
+            patterns.append(f"%{seg}%")
+
+    return patterns
+
+
+def retrieve_path_filtered(
+    db_path: Path, query: str, top_k: int, patterns: list[str]
+) -> list[dict]:
+    """BM25 over chunks whose file_path matches any LIKE pattern.
+
+    Empty patterns → empty result. The same in-memory FTS5 strategy as
+    retrieve_keyword, but the FTS table is populated only with matching
+    chunks. When the constraint is narrow (e.g., '%.vbs' in this index =
+    8 files), this guarantees those files compete only against each other.
+    """
+    if not patterns:
+        return []
+    where_clauses = " OR ".join(["file_path LIKE ?"] * len(patterns))
+    fts_q = _fts_query(query)
+
+    conn = _vec_conn(db_path)
+    try:
+        rows: list = []
+        # 1. BM25 within the constraint, IF we have query tokens to match on.
+        if fts_q:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE temp.chunks_fts_pf USING fts5(
+                    content,
+                    chunk_id UNINDEXED,
+                    tokenize='unicode61 remove_diacritics 2'
+                )
+                """
+            )
+            conn.execute(
+                f"INSERT INTO temp.chunks_fts_pf(chunk_id, content) "
+                f"SELECT id, content FROM main.code_chunk WHERE {where_clauses}",
+                patterns,
+            )
+            rows = conn.execute(
+                """
+                SELECT
+                    c.id, c.chunk_type, c.symbol_name,
+                    c.file_path, c.start_line, c.end_line, c.content,
+                    bm25(chunks_fts_pf) AS score
+                FROM chunks_fts_pf
+                JOIN main.code_chunk c ON c.id = chunks_fts_pf.chunk_id
+                WHERE chunks_fts_pf MATCH ?
+                ORDER BY bm25(chunks_fts_pf)
+                LIMIT ?
+                """,
+                [fts_q, top_k],
+            ).fetchall()
+
+        # 2. Fallback: BM25 produced nothing (common when the query asks
+        # *about* a file type rather than about its content — e.g.,
+        # ".vbs scripts exist" doesn't appear in any .vbs file's body).
+        # Return one file_overview per matching file so the caller sees
+        # what's there.
+        if not rows:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id, chunk_type, symbol_name,
+                    file_path, start_line, end_line, content,
+                    0.0 AS score
+                FROM main.code_chunk
+                WHERE ({where_clauses}) AND chunk_type='file_overview'
+                ORDER BY file_path
+                LIMIT ?
+                """,
+                patterns + [top_k],
+            ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
 def retrieve(
     db_path: Path,
     query: str,
     top_k: int = 8,
     mode: str = "hybrid",
     candidates: int = 30,
+    path_aware: bool = True,
 ) -> list[dict]:
-    """Dispatch to the requested retrieval strategy."""
+    """Dispatch to the requested retrieval strategy.
+
+    In hybrid mode with `path_aware=True` (default), a third source is
+    added when the query mentions a file extension (".vbs files") or a
+    distinctive directory segment ("19.0", "Div_Map Archive"): a BM25
+    pool restricted to chunks whose file_path matches. Without it,
+    type-narrow questions return drowning-in-irrelevant-files results
+    because neither vector nor full-content BM25 indexes file paths.
+    """
     if mode == "vector":
         return retrieve_vector(db_path, query, top_k)
     if mode == "keyword":
         return retrieve_keyword(db_path, query, top_k)
     if mode == "hybrid":
         n = max(candidates, top_k)
-        v = retrieve_vector(db_path, query, n)
-        k = retrieve_keyword(db_path, query, n)
-        return fuse_rrf(v, k, top_k)
+        sources_lists: dict[str, list[dict]] = {
+            "vec": retrieve_vector(db_path, query, n),
+            "kw": retrieve_keyword(db_path, query, n),
+        }
+        weights = {"vec": 1.0, "kw": 1.0}
+        patterns: list[str] = []
+        if path_aware:
+            patterns = _extract_path_constraints(query, db_path)
+            if patterns:
+                sources_lists["path"] = _path_source_interleaved(
+                    db_path, query, n, patterns
+                )
+                weights["path"] = 2.0
+        fused = fuse_rrf(sources_lists, top_k, weights=weights)
+
+        # Coverage guarantee: when multiple distinct path patterns are
+        # detected, each pattern should have at least one chunk in top_k.
+        # RRF can otherwise let an over-represented pattern crowd out a
+        # narrowly-mentioned one (e.g. broad "Div_Map Archive" vs. narrow
+        # "19.0/*.cs"). Force-include the per-pattern top-1 if missing,
+        # replacing the lowest-scored vec/kw-only chunks.
+        if path_aware and len(patterns) > 1:
+            fused = _ensure_pattern_coverage(db_path, query, patterns, fused, top_k)
+        return fused
+
+
+def _ensure_pattern_coverage(
+    db_path: Path,
+    query: str,
+    patterns: list[str],
+    fused: list[dict],
+    top_k: int,
+) -> list[dict]:
+    """Guarantee at least one chunk per path pattern in top_k.
+
+    For each pattern, look up its top-1 BM25 hit (path-filtered). If absent
+    from `fused`, append it and drop the lowest-scored entry whose source
+    set is *not* {path} (so we don't sacrifice path-source coverage to make
+    room for itself). Replacement preserves rank order otherwise.
+    """
+    present_ids = {c["id"] for c in fused}
+    forced: list[dict] = []
+    for p in patterns:
+        top1 = retrieve_path_filtered(db_path, query, 1, [p])
+        if not top1:
+            continue
+        cid = top1[0]["id"]
+        if cid in present_ids or cid in {c["id"] for c in forced}:
+            continue
+        # Annotate so the trace output shows the chunk was forced-included
+        # for pattern coverage.
+        chunk = dict(top1[0])
+        chunk["sources"] = ["path-forced"]
+        chunk["ranks"] = {"path-forced": 1}
+        forced.append(chunk)
+
+    if not forced:
+        return fused
+
+    out = list(fused)
+    for chunk in forced:
+        # Find a non-path-only chunk to evict (scan from the bottom).
+        evict_idx = None
+        for i in range(len(out) - 1, -1, -1):
+            srcs = set(out[i].get("sources", []))
+            if srcs != {"path"}:
+                evict_idx = i
+                break
+        if evict_idx is None:
+            # All current entries are path-source only — append, trim later.
+            out.append(chunk)
+        else:
+            out[evict_idx] = chunk
+
+    return out[:top_k]
+
+
+def _path_source_interleaved(
+    db_path: Path, query: str, n: int, patterns: list[str]
+) -> list[dict]:
+    """Path-source for fusion. Single-pattern: pass through. Multi-pattern:
+    round-robin top-N across each pattern's independent ranked list, deduped
+    by chunk id, so each pattern gets equal representation regardless of how
+    BM25 over the combined pool would weight them.
+
+    Motivation: when a user mentions multiple distinct file types or paths
+    (".cs files under 19.0/" vs ".lsp files under Div_Map Archive/"),
+    pooling all matches into one BM25 rank lets one side dominate by token
+    volume — interleaving guarantees both halves of a comparison surface.
+    """
+    if len(patterns) <= 1:
+        return retrieve_path_filtered(db_path, query, n, patterns)
+    per_pattern = [retrieve_path_filtered(db_path, query, n, [p]) for p in patterns]
+    out: list[dict] = []
+    seen: set[int] = set()
+    for i in range(n):
+        for results in per_pattern:
+            if i >= len(results):
+                continue
+            cid = results[i]["id"]
+            if cid in seen:
+                continue
+            out.append(results[i])
+            seen.add(cid)
+            if len(out) >= n:
+                return out
+    return out
     raise ValueError(f"unknown mode: {mode}")
 
 
@@ -274,6 +531,8 @@ def main() -> int:
                         help="Retrieval strategy (default: hybrid)")
     parser.add_argument("--candidates", type=int, default=30,
                         help="Per-side candidates pulled before fusion (hybrid only)")
+    parser.add_argument("--no-path-aware", action="store_true",
+                        help="Disable the path-filtered third source in hybrid mode")
     parser.add_argument("--model", default=DEFAULT_CLAUDE)
     parser.add_argument("--raw", action="store_true",
                         help="Print only retrieval results, skip LLM")
@@ -286,7 +545,10 @@ def main() -> int:
         print(f"ERROR: {db_path} not found", file=sys.stderr)
         return 2
 
-    chunks = retrieve(db_path, args.query, args.top_k, args.mode, args.candidates)
+    chunks = retrieve(
+        db_path, args.query, args.top_k, args.mode, args.candidates,
+        path_aware=not args.no_path_aware,
+    )
 
     if args.raw:
         if args.json:
