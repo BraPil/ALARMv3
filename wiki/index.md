@@ -1,6 +1,6 @@
 # ALARMv3 Wiki Index
 
-Last updated: 2026-04-29 | Pages: 16
+Last updated: 2026-04-29 | Pages: 17
 
 ## Project
 
@@ -35,4 +35,5 @@ Last updated: 2026-04-29 | Pages: 16
 
 ## Runbooks
 
-- [Full-archive run](runbooks/full-archive-run.md) — Pre-flight checklist, engine settings to verify, post-run sanity checks, known silent-failure paths, RAG querying patterns. Read before starting any new codebase (e.g. BillGen).
+- [Full-archive run](runbooks/full-archive-run.md) — Pre-flight checklist, engine settings to verify, post-run sanity checks, known silent-failure paths, RAG querying patterns. Read before starting any new codebase.
+- [BillGen live-demo runbook](runbooks/billgen-live-demo.md) — Day-by-day playbook for end-to-end modernization (5-7 days). Synthesizes every lesson from the ADDS run; templates the next codebase.

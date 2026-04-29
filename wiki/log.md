@@ -4,6 +4,31 @@ Append-only. Most recent at top.
 
 ---
 
+## [2026-04-29] handoff | BillGen live-demo runbook + kickoff prompt ready for next session
+
+End-of-day handoff package for the BillGen modernization run. Synthesizes every lesson from the ADDS execution into an executable playbook plus a paste-ready prompt to drop into a fresh Claude Code session tomorrow.
+
+**Pages added**:
+- `wiki/runbooks/billgen-live-demo.md` — day-by-day playbook (Day 0 pre-flight → Day 7 hand-off). 5-7 days of focused engineer time. References the ADDS template throughout via GitHub URLs so a cold session can resolve them.
+- `launch-prompts/billgen-kickoff.md` — paste-ready prompt for a new Claude Code session. Includes the long form (with required-reading list, Phase 0 pause checkpoint, day-by-day structure, critical constraints reminder block) and a shorter autonomous variant for runs 2+.
+
+**Lessons captured in the runbook (from ADDS)**:
+- `[SuppressUnmanagedCodeSecurity]` strip needs to catch BOTH bare and fully-qualified attribute forms
+- Version-pinned native API references (`acdb17.dll` stuck on AutoCAD 2007 by accident-of-history) need careful audit and `dumpbin /EXPORTS` capture for new host versions
+- "Hardcoded credentials" is overloaded — separate the actual hardcoded values, the salt-from-tutorial, and the `Password=" + var + "` concat issue (different fixes)
+- "UNC paths" might not be UNC strings (ADDS used `MapDrive "M:", "server", "share"` calls instead). A generic `\\X\Y` regex is a false-positive trap
+- Build reranker prompts with f-strings, not `str.format()` — chunk content contains literal `{}` from C# array initializers
+- LISP / embedded scripting files port unchanged when the host application provides the runtime; do NOT rewrite them as part of the forced minimum
+- The forced-vs-optional distinction is the discipline that prevents legacy-modernization-as-rewrite
+
+**Pre-flight checklist** for each new codebase included at the bottom of the runbook (covers source archive, modernized target, analysis workspace, ALARMv3 engine, Phase 0 unblocking decisions, expected outputs).
+
+**Pages updated**:
+- `wiki/index.md` (page count → 17)
+- `wiki/log.md` (this entry)
+
+---
+
 ## [2026-04-29] application | First downstream consumer of the RAG pipeline — full ADDS modernization plan committed and Phases 1-5 executed (code-level)
 
 The 4-source hybrid + reranker RAG (per the prior log entry) was used to drive the discovery pass for an ADDS modernization plan, then the plan was executed end-to-end as far as a Linux Codespace permits.
