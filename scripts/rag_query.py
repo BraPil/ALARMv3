@@ -42,6 +42,7 @@ import sqlite_vec
 
 OLLAMA_MODEL = "nomic-embed-text"
 DEFAULT_CLAUDE = "claude-sonnet-4-6"
+DEFAULT_RERANK = "claude-haiku-4-5-20251001"
 
 _RAG_PROMPT = """\
 You are an expert code-archaeology assistant for the ADDS legacy codebase
@@ -451,6 +452,9 @@ def retrieve(
     mode: str = "hybrid",
     candidates: int = 30,
     path_aware: bool = True,
+    rerank: bool = False,
+    rerank_model: str = DEFAULT_RERANK,
+    rerank_pool: int = 20,
 ) -> list[dict]:
     """Dispatch to the requested retrieval strategy.
 
@@ -489,17 +493,21 @@ def retrieve(
                     db_path, query, n, "secret_pattern"
                 )
                 weights["secret"] = 2.0
-        fused = fuse_rrf(sources_lists, top_k, weights=weights)
 
-        # Coverage guarantee: when multiple distinct path patterns are
-        # detected, each pattern should have at least one chunk in top_k.
-        # RRF can otherwise let an over-represented pattern crowd out a
-        # narrowly-mentioned one (e.g. broad "Div_Map Archive" vs. narrow
-        # "19.0/*.cs"). Force-include the per-pattern top-1 if missing,
-        # replacing the lowest-scored vec/kw-only chunks.
+        # Coverage guarantee + reranker pool sizing: when reranking, fuse
+        # to a wider window so the reranker has more candidates to work
+        # with. Pattern coverage runs over that same wider window.
+        target_k = max(rerank_pool, top_k) if rerank else top_k
+        fused = fuse_rrf(sources_lists, target_k, weights=weights)
         if path_aware and len(patterns) > 1:
-            fused = _ensure_pattern_coverage(db_path, query, patterns, fused, top_k)
-        return fused
+            fused = _ensure_pattern_coverage(
+                db_path, query, patterns, fused, target_k
+            )
+
+        if rerank:
+            reranked = rerank_with_llm(query, fused, model=rerank_model)
+            return reranked[:top_k]
+        return fused[:top_k]
 
 
 def _ensure_pattern_coverage(
@@ -586,6 +594,107 @@ def _path_source_interleaved(
     raise ValueError(f"unknown mode: {mode}")
 
 
+_RERANK_PROMPT = """\
+You are scoring code chunks for relevance to a single user question.
+
+For each chunk below (numbered 1..{n}), output an integer relevance score
+from 0 to 100 where:
+  100 = chunk directly answers the question (e.g. it IS the function/code
+        the user asked about, or contains the literal facts requested)
+   50 = chunk is related context that helps answer the question but is
+        not itself the answer
+    0 = chunk is irrelevant — different topic, boilerplate, or noise
+
+Output ONLY a JSON array of {n} integers in chunk order, no prose, no
+keys, no explanation. Example for 3 chunks: [85, 12, 0]
+"""
+
+
+def _rerank_chunk_block(c: dict, n: int, max_chars: int = 800) -> str:
+    """One-line metadata + truncated content, designed for reranker prompts.
+
+    Uses an f-string so chunk content (which often contains literal `{}`
+    from C# array initializers, JSON, etc.) doesn't get interpreted as
+    format placeholders.
+    """
+    sym = c.get("symbol_name") or ""
+    body = (c.get("content") or "").strip()
+    if len(body) > max_chars:
+        body = body[:max_chars] + " ..."
+    return (
+        f"chunk {n}: {c['file_path']}:{c['start_line']}-{c['end_line']} "
+        f"({c['chunk_type']} {sym})\n{body}"
+    )
+
+
+def rerank_with_llm(
+    query: str, candidates: list[dict], model: str = DEFAULT_RERANK
+) -> list[dict]:
+    """LLM-as-reranker. Sends a batch of candidates to Claude with a
+    score-per-chunk prompt, parses the JSON array, returns the same list
+    re-sorted by reranker score (desc), with `score` overwritten and
+    `sources` augmented with 'rerank'.
+
+    Failure mode: if the model returns malformed output, we fall back to
+    the original (RRF) order so reranking is never worse than not reranking.
+    """
+    if not candidates:
+        return candidates
+    import anthropic
+    client = anthropic.Anthropic()
+
+    chunk_blocks = [
+        _rerank_chunk_block(c, i + 1) for i, c in enumerate(candidates)
+    ]
+    prompt = (
+        f"Question: {query}\n\n"
+        f"Chunks:\n\n" + "\n\n---\n\n".join(chunk_blocks)
+    )
+
+    try:
+        msg = client.messages.create(
+            model=model,
+            max_tokens=400,
+            system=[{"type": "text",
+                     "text": _RERANK_PROMPT.format(n=len(candidates)),
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+    except Exception:
+        return candidates  # API failure → fall back to RRF order
+
+    # Parse the first JSON array we find. Reranker prompt asks for nothing
+    # else, but defensive: tolerate stray text around it.
+    m = re.search(r"\[\s*[\d\s,.-]+\s*\]", raw)
+    if not m:
+        return candidates
+    try:
+        scores = json.loads(m.group(0))
+        if (not isinstance(scores, list)
+                or len(scores) != len(candidates)
+                or not all(isinstance(s, (int, float)) for s in scores)):
+            return candidates
+    except json.JSONDecodeError:
+        return candidates
+
+    paired = list(zip(candidates, scores))
+    paired.sort(key=lambda x: -x[1])
+    out: list[dict] = []
+    for rank, (c, s) in enumerate(paired, start=1):
+        c2 = dict(c)
+        c2["score"] = float(s)
+        srcs = list(c2.get("sources", []))
+        if "rerank" not in srcs:
+            srcs.append("rerank")
+        c2["sources"] = sorted(srcs)
+        ranks = dict(c2.get("ranks", {}))
+        ranks["rerank"] = rank
+        c2["ranks"] = ranks
+        out.append(c2)
+    return out
+
+
 def _format_chunks(chunks: list[dict]) -> str:
     parts: list[str] = []
     for i, c in enumerate(chunks, start=1):
@@ -635,6 +744,12 @@ def main() -> int:
                         help="Per-side candidates pulled before fusion (hybrid only)")
     parser.add_argument("--no-path-aware", action="store_true",
                         help="Disable the path-filtered third source in hybrid mode")
+    parser.add_argument("--rerank", action="store_true",
+                        help="LLM-rerank the top-N candidates after RRF fusion")
+    parser.add_argument("--rerank-model", default=DEFAULT_RERANK,
+                        help=f"Reranker model id (default: {DEFAULT_RERANK})")
+    parser.add_argument("--rerank-pool", type=int, default=20,
+                        help="Candidates fed to the reranker before truncation to top-k")
     parser.add_argument("--model", default=DEFAULT_CLAUDE)
     parser.add_argument("--raw", action="store_true",
                         help="Print only retrieval results, skip LLM")
@@ -650,6 +765,9 @@ def main() -> int:
     chunks = retrieve(
         db_path, args.query, args.top_k, args.mode, args.candidates,
         path_aware=not args.no_path_aware,
+        rerank=args.rerank,
+        rerank_model=args.rerank_model,
+        rerank_pool=args.rerank_pool,
     )
 
     if args.raw:
