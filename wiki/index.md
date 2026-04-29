@@ -1,6 +1,6 @@
 # ALARMv3 Wiki Index
 
-Last updated: 2026-04-29 | Pages: 15
+Last updated: 2026-04-29 | Pages: 16
 
 ## Project
 
@@ -11,6 +11,7 @@ Last updated: 2026-04-29 | Pages: 15
 - [Phase 4 Plan](project/phase4-plan.md) — Implementation mode: plan/build/eval, git clone to TARGET, human-gated commits
 - [ALARM Lineage: v1 → v2 → v3](project/alarm-lineage.md) — How each generation corrected the last; the v3 synthesis
 - [AAA + ALARMv3 Strategy](project/aaa-alarmv3-strategy.md) — Companion project relationship, key architectural decisions, open questions
+- [ADDS Modernization Plan](project/adds-modernization-plan.md) — AutoCAD Map 3D 2025 / Oracle 19c / .NET 8; phased ~11-week migration plan + ranked opportunity backlog (RAG-derived current-state baseline)
 
 ## Concepts
 
