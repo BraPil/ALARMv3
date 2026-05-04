@@ -93,18 +93,26 @@ def analyze(source_path: str, workspace: str, workers: int):
             result = Orchestrator(session).synthesize_recommendations()
             session.transition_to(SessionState.RECOMMENDATIONS_PENDING_REVIEW)
             prog.update(task, description="Running adversarial evaluator...")
-            # CLI is non-interactive: auto-accept only evaluator-approved recommendations.
-            # 'pending'/'revise'/'reject' rows stay pending and require human review.
-            import sqlite3 as _sqlite3
-            _conn = _sqlite3.connect(session.artifact_dir / "analysis.db", timeout=10)
-            _conn.execute("PRAGMA journal_mode=WAL")
-            _conn.execute(
-                "UPDATE recommendation SET review_status='accepted', approved=1 "
-                "WHERE session_id=? AND evaluator_verdict='accept'",
-                (session.session_id,),
-            )
-            _conn.commit()
-            _conn.close()
+            # CLI is non-interactive. Two modes:
+            #   1. If .alarmv3/policy/autopilot.yaml exists, route through
+            #      AutopilotPolicy.apply_to_session() (verdict gate + policy rules).
+            #   2. Otherwise fall back to the verdict-only gate: accept everything
+            #      the evaluator approved.
+            from ..core.autopilot import AutopilotPolicy
+            policy = AutopilotPolicy(session.alarm_dir)
+            if policy.policy_file_exists:
+                policy.apply_to_session(session)
+            else:
+                import sqlite3 as _sqlite3
+                _conn = _sqlite3.connect(session.artifact_dir / "analysis.db", timeout=10)
+                _conn.execute("PRAGMA journal_mode=WAL")
+                _conn.execute(
+                    "UPDATE recommendation SET review_status='accepted', approved=1 "
+                    "WHERE session_id=? AND evaluator_verdict='accept'",
+                    (session.session_id,),
+                )
+                _conn.commit()
+                _conn.close()
             session.transition_to(SessionState.ANALYSIS_COMPLETE)
         ev = result.get("evaluator_summary", {})
         console.print(

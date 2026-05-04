@@ -99,3 +99,58 @@ class AutopilotPolicy:
         if not self._policy_path.exists():
             self._policy_path.write_text(_POLICY_TEMPLATE)
         return str(self._policy_path)
+
+    @property
+    def policy_file_exists(self) -> bool:
+        """True if a policy file is present on disk. Caller can use this to
+        decide between autopilot routing and a simpler fallback path."""
+        return self._policy_path.exists()
+
+    def apply_to_session(self, session) -> dict:
+        """Apply autopilot policy to a session's recommendations.
+
+        Two-stage filter: (1) only recommendations with evaluator_verdict='accept'
+        are eligible; (2) of those, autopilot rules further filter by
+        category / risk_score / evaluator_effort. Eligible recs have
+        review_status flipped to 'accepted'; ineligible ones stay pending.
+
+        Returns a summary dict with three lists for caller logging:
+            accepted        — list of {"rank": int, "rule": str}
+            skipped_by_verdict   — list of {"rank": int, "verdict": str}
+            skipped_by_policy    — list of {"rank": int, "reason": str}
+        """
+        import sqlite3
+        db = session.artifact_dir / "analysis.db"
+        conn = sqlite3.connect(db, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        accepted: list[dict] = []
+        skipped_by_verdict: list[dict] = []
+        skipped_by_policy: list[dict] = []
+        try:
+            rows = conn.execute(
+                "SELECT rank, category, risk_score, evaluator_effort, evaluator_verdict "
+                "FROM recommendation WHERE session_id=?",
+                (session.session_id,),
+            ).fetchall()
+            for rank, category, risk_score, effort, verdict in rows:
+                if verdict != "accept":
+                    skipped_by_verdict.append({"rank": rank, "verdict": verdict})
+                    continue
+                ok, reason = self.should_auto_accept(category, risk_score, effort)
+                if ok:
+                    conn.execute(
+                        "UPDATE recommendation SET review_status='accepted', approved=1 "
+                        "WHERE session_id=? AND rank=?",
+                        (session.session_id, rank),
+                    )
+                    accepted.append({"rank": rank, "rule": reason})
+                else:
+                    skipped_by_policy.append({"rank": rank, "reason": reason})
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "accepted": accepted,
+            "skipped_by_verdict": skipped_by_verdict,
+            "skipped_by_policy": skipped_by_policy,
+        }

@@ -170,13 +170,31 @@ def test_accept_sql_skips_revise_verdict(tmp_path):
 
 
 def test_demo_auto_accept_helper_respects_verdict(tmp_path):
-    """scripts/demo_full_run.auto_accept_all_recommendations() honors evaluator_verdict."""
+    """scripts/demo_full_run.auto_accept_all_recommendations() honors evaluator_verdict
+    AND the autopilot policy. Both gates apply."""
     import importlib.util
     from pathlib import Path as _Path
+    import yaml as _yaml
 
     session = _seed_session_at_pending_review(
         tmp_path, verdicts={1: "accept", 2: "revise", 3: "accept"},
     )
+    # Seed risk_score so autopilot rules can match
+    db_seed = session.artifact_dir / "analysis.db"
+    _c = sqlite3.connect(db_seed)
+    _c.execute(
+        "UPDATE recommendation SET risk_score=2, evaluator_effort='M' "
+        "WHERE session_id=?", (session.session_id,))
+    _c.commit()
+    _c.close()
+
+    # Write a permissive autopilot policy so the demo's call gets through both gates
+    policy_path = session.alarm_dir / "policy" / "autopilot.yaml"
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_path.write_text(_yaml.dump({
+        "enabled": True,
+        "rules": [{"category": "security", "max_risk_level": 5, "max_effort": "XL"}],
+    }))
 
     # Import the script as a module
     repo_root = _Path(__file__).resolve().parents[2]
@@ -186,17 +204,20 @@ def test_demo_auto_accept_helper_respects_verdict(tmp_path):
     demo_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(demo_mod)
 
-    n = demo_mod.auto_accept_all_recommendations(session)
-    assert n == 2  # ranks 1 and 3 only
+    summary = demo_mod.auto_accept_all_recommendations(session, session.alarm_dir)
+    accepted_ranks = {r["rank"] for r in summary["accepted"]}
+    skipped_by_verdict = {r["rank"] for r in summary["skipped_by_verdict"]}
+    assert accepted_ranks == {1, 3}
+    assert skipped_by_verdict == {2}
 
     db = session.artifact_dir / "analysis.db"
     conn = sqlite3.connect(db)
-    accepted_ranks = {row[0] for row in conn.execute(
+    db_accepted = {row[0] for row in conn.execute(
         "SELECT rank FROM recommendation WHERE session_id=? AND review_status='accepted'",
         (session.session_id,),
     ).fetchall()}
     conn.close()
-    assert accepted_ranks == {1, 3}
+    assert db_accepted == {1, 3}
 
 
 def test_review_transitions_to_analysis_complete(tmp_path):

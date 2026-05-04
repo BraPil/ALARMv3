@@ -76,28 +76,20 @@ def poll_job(orch, job_id: str, label: str, timeout_s: int = 7200) -> dict:
         time.sleep(5)
 
 
-def auto_accept_all_recommendations(session) -> int:
-    """Auto-accept only recommendations the adversarial evaluator marked 'accept'.
+def auto_accept_all_recommendations(session, alarm_dir: Path) -> dict:
+    """Apply autopilot policy + verdict gate to a session's recommendations.
 
-    Recommendations with evaluator_verdict in {'pending','revise','reject'} are
-    left untouched and require human review via the MCP tool. This is the safe
-    default for non-interactive runs; see post-mortem §11 for context.
+    Routes through AutopilotPolicy.apply_to_session() so the demo respects the
+    same two-stage filter (evaluator_verdict='accept' AND policy-rule match)
+    that the rest of the engine uses. Demo's ensure_autopilot() writes a
+    permissive policy first, so under default demo flow this still accepts
+    everything the evaluator approved.
+
+    Returns the autopilot summary dict {accepted, skipped_by_verdict,
+    skipped_by_policy}.
     """
-    db_path = session.artifact_dir / "analysis.db"
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        "UPDATE recommendation SET review_status='accepted', approved=1 "
-        "WHERE session_id=? AND evaluator_verdict='accept'",
-        (session.session_id,),
-    )
-    n = conn.execute(
-        "SELECT COUNT(*) FROM recommendation WHERE session_id=? AND approved=1",
-        (session.session_id,),
-    ).fetchone()[0]
-    conn.commit()
-    conn.close()
-    return n
+    from alarmv3.core.autopilot import AutopilotPolicy
+    return AutopilotPolicy(alarm_dir).apply_to_session(session)
 
 
 def get_recommendation_ranks(session) -> list[int]:
@@ -201,11 +193,22 @@ def main() -> None:
         if session.state == SessionState.ANALYSIS_IN_PROGRESS:
             session.transition_to(SessionState.RECOMMENDATIONS_PENDING_REVIEW)
 
-    # ── Phase 3 review gate (auto-accept all in non-interactive run) ─────
+    # ── Phase 3 review gate (autopilot-routed in non-interactive run) ─────
     if session.state == SessionState.RECOMMENDATIONS_PENDING_REVIEW:
-        n = auto_accept_all_recommendations(session)
+        # Demo's ensure_autopilot() (called later before implementation) writes
+        # a permissive policy. For the review gate we need the policy in place
+        # NOW; call ensure_autopilot here too so the autopilot router has a file.
+        ensure_autopilot(session.alarm_dir)
+        summary = auto_accept_all_recommendations(session, session.alarm_dir)
         session.transition_to(SessionState.ANALYSIS_COMPLETE)
-        log(f"Auto-accepted {n} recommendations (non-interactive run)")
+        n_acc = len(summary["accepted"])
+        n_v = len(summary["skipped_by_verdict"])
+        n_p = len(summary["skipped_by_policy"])
+        log(
+            f"Autopilot: accepted {n_acc}; "
+            f"skipped {n_v} by verdict, {n_p} by policy "
+            f"(non-interactive run)"
+        )
 
     if args.skip_implementation:
         log("Stopping before implementation (--skip-implementation set)")
