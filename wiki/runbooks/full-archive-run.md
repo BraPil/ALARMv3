@@ -429,13 +429,41 @@ checked.**
 
 ---
 
-## 8. BillGen-specific notes (TODO when starting)
+## 8. Per-codebase prep checklist
 
-This section is empty until the first BillGen run. Planned additions:
-- Domain summary (one paragraph — what BillGen does, sourced from code or docs)
-- Expected eligible-file count after binary blocklist
-- Anything BillGen-specific the analyzer doesn't know (custom languages, calling conventions, build system gotchas)
-- Inputs the autopilot policy should be tightened for (e.g. "block any change touching billing-rate code without explicit accept")
+Before ALARMv3 is turned on a new legacy codebase, capture the following.
+Each item exists because of a specific failure or near-miss observed on
+prior runs. Cross-reference the post-mortem at
+`BraPil/ADDS_modernized_run2:Documentation/postmortem-and-billgen-readiness.md`
+for the underlying evidence.
+
+**Codebase profile (one paragraph each):**
+- Domain summary — what the system does, sourced from code or docs.
+- Language mix and toolchains (e.g. ".NET Framework 4.6 + T-SQL stored procs + classic ASP").
+- Build host requirements — Linux-friendly toolchain or Windows/COM-locked? If the latter, build verification (P1 #5 in the post-mortem) needs a remote-execution path.
+- Output type — running plugin, generated artifact (bills, reports), or both? Generated-artifact codebases unlock the output-equivalence reconciliation gate.
+- Production reference — is there a "gold-standard" environment to diff against?
+
+**Engine wiring (see post-mortem §7):**
+- Create `policy/<codebase>.toml` (or `.yaml`) overlay loaded via `--policy`. Inherits: system prompt, `_EXT_PATTERNS`, `_PATH_STOP`, `IGNORED_EXTENSIONS`, `_SECRET_QUERY_KEYWORDS`, secret-pattern regexes, wiki template, commit-message format, build command for Phase 5b.
+- Verify auto-accept paths are gated. After P0 lands, the three call sites (`scripts/demo_full_run.py:84-86`, `src/alarmv3/cli/main.py:100-103`, `src/alarmv3/mcp/tools.py:364-368`) must include `AND evaluator_verdict='accept'` in their `UPDATE recommendation` SQL, and demo + CLI must route through `Autopilot.should_auto_accept()`.
+- Initialize an autopilot policy file under `.alarmv3/policy/autopilot.yaml` or accept the safe-default (auto-accept disabled).
+- Identify any codebase-specific binary blobs to add to `IGNORED_EXTENSIONS` after the first crawl (e.g. `.rpt`, `.dacpac`, `.dwg`).
+
+**Anti-coupling audit (so prior runs don't leak):**
+- Grep the codebase tree for prior-codebase identifiers in checked-in files
+  (developer NTIDs, hardcoded workstation names, dev-only DataSource strings,
+  personal share paths). Document in a contamination report; flag any found
+  to autopilot policy as "block changes that touch this without explicit
+  accept."
+- Verify no ADDS-specific terminology has leaked into the prompts being
+  used. Once the policy overlay (P0 #3) lands, `policy/<codebase>.toml`
+  is the single source of truth.
+
+**Pause checkpoints:**
+- After Phase 0 discovery, before Phase 1, a human reads the manifest summary and confirms the eligible-file count is in the expected ballpark.
+- After the adversarial evaluator (Phase 3), a human reviews `evaluator_verdict='revise'` rows before any auto-accept.
+- After Phase 4 implementation diffs, before any commit, the build-verification phase (P1 #5 once landed) gates each diff; failed builds block commit.
 
 ## See also
 

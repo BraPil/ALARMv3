@@ -4,6 +4,40 @@ Append-only. Most recent at top.
 
 ---
 
+## [2026-05-04] post-mortem | ADDS modernization comparison + cross-model verification + P0 plan locked
+
+End-of-day post-mortem on the ADDS run. Three parallel research agents (one per repo) compared `BraPil/ADDS2025` (human-led, shipped to production 2026-01-28) vs. `BraPil/ADDS_modernized_run2` (AI-led, ALARMv3 output, never built). A second model (GPT-5.5) did the same task independently in a separate Claude Code session; verifying their findings against the local working tree at `aee03c6` produced a sharper P0 plan.
+
+**Single-source post-mortem:** `BraPil/ADDS_modernized_run2:Documentation/postmortem-and-billgen-readiness.md` (file retains the BillGen-tagged name for stable URLs; content is now codebase-agnostic).
+
+**Headline finding:** ALARMv3 already has the schema and infrastructure to gate auto-accept; nobody enforces it. `src/alarmv3/core/index.py:115-119` defines `evaluator_verdict ∈ {pending,accept,revise,reject}` and `review_status ∈ {pending,accepted,rejected}` as separate columns. Three independent code paths issue `UPDATE recommendation SET review_status='accepted' …` with no predicate on `evaluator_verdict`:
+- `scripts/demo_full_run.py:79-86` (helper) called from `:197-201` (review-gate site)
+- `src/alarmv3/cli/main.py:96-103` (independent inline copy)
+- `src/alarmv3/mcp/tools.py:363-368` (the human review tool itself)
+
+`src/alarmv3/core/autopilot.py:53-101` is the unused safe gate — full policy engine with category/risk/effort rules and a safe default (`enabled: False`) when no policy file. Routing the demo and CLI auto-accept through it would honor the architectural intent the schema already encodes.
+
+**P0 plan (in execution):**
+1. Add `AND evaluator_verdict='accept'` predicate at all three SQL sites; tests assert `revise`/`reject` cannot be auto-accepted.
+2. Route demo + CLI through `Autopilot.should_auto_accept()`; default-disabled fallback.
+3. Per-codebase policy overlay (`--policy` flag) — replaces hardcoded ADDS strings at `scripts/rag_query.py:47-49,224-241`, `scripts/generate_full_wiki.py:395,448`, `src/alarmv3/core/synthesis.py:22-45`, `src/alarmv3/core/deep_analysis.py:127-142`. Extract current values into `policy/adds.toml` for back-compat.
+4. Update `wiki/runbooks/full-archive-run.md §8` from BillGen-specific placeholder to next-codebase prep checklist.
+
+**P1 backlog (queued):** build-verification phase 5b; hypothesis ledger (new `hypothesis`/`hypothesis_evidence`/`hypothesis_decision` tables — schema in post-mortem §11.1, contributed by GPT-5.5 with `chunk_id` FK for retrieval-replay determinism); LLM-as-acceptance-checker phase; default `--rerank` on; encoding hardening (`charset-normalizer` fallback chain); `CHECK` constraint on `manifest.relative_path NOT LIKE '/%'`; `IGNORED_EXTENSIONS` from policy.
+
+**Cross-model lessons captured:**
+- Two-model + verification raised confidence and shrunk the P0 acceptance-gate fix from "redesign state machine" to "3-line SQL patch." Pattern worth repeating on the next major analysis.
+- GPT-5.5 contributed: hypothesis-ledger concept (motivated by ADDS2025's APC Transmission 3-pass theory-evolution report), output-equivalence reconciliation spec (P2 #16, applies to generated-artifact codebases), specific LISP digitizer back-port (`Updated Files/lisp/Adds/Lisp/Adds.Lsp` lines 746/751-752/757-758/766-767 still have the unsafe `(atof (getcfg "AppData/Adds/DigiURx"))` `stringp nil` path that ADDS2025 fixed via `LoadMouseCfg` + `ADDS25_LISP_Startup.log`).
+- Opus 4.7 contributed: code-pointer-level analysis; identified that the schema and autopilot infrastructure already exist; concrete back-port list against ADDS2025; deferred-validation framing.
+
+**Memory entries added (durable cross-session):** `adds2025_human_refactor.md`, `run2_outperformed_adds2025.md`, `alarmv3_billgen_strengthening.md` — referenced from `MEMORY.md`.
+
+**Pages updated:**
+- `wiki/runbooks/full-archive-run.md §8` — BillGen placeholder → "Per-codebase prep checklist" (codebase-agnostic, references the post-mortem)
+- `wiki/log.md` (this entry)
+
+---
+
 ## [2026-04-29] handoff | BillGen live-demo runbook + kickoff prompt ready for next session
 
 End-of-day handoff package for the BillGen modernization run. Synthesizes every lesson from the ADDS execution into an executable playbook plus a paste-ready prompt to drop into a fresh Claude Code session tomorrow.
