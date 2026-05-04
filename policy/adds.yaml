@@ -1,0 +1,103 @@
+# Codebase policy overlay for the ADDS modernization.
+# Loaded via --policy policy/adds.yaml on rag_query.py, generate_full_wiki.py,
+# and CLI commands. See src/alarmv3/core/codebase_policy.py for the schema
+# and BraPil/ADDS_modernized_run2:Documentation/postmortem-and-billgen-readiness.md
+# for context on why the engine is being de-coupled from a single codebase.
+#
+# Every field is OPTIONAL. Anything not specified falls back to the engine's
+# hardcoded default. This file extracts the values the engine used to inline
+# directly during the ADDS run, so that --policy adds.yaml reproduces the
+# original behavior end-to-end.
+
+codebase:
+  name: ADDS
+  description: >
+    AutoCAD Map 3D 2025 plugin: AutoLISP + C# + PowerShell + Oracle.
+    35-year codebase being modernized from .NET Framework 4.6 / AutoCAD 2007
+    DLLs to .NET 8 / AutoCAD 2025.
+
+# Replaces _RAG_PROMPT in scripts/rag_query.py:47-61 when policy is loaded.
+rag_prompt: |
+  You are an expert code-archaeology assistant for the ADDS legacy codebase
+  (AutoCAD plugin: AutoLISP + C# + PowerShell + Oracle). The user has asked a
+  question about the codebase. Below are the {n} most-relevant code chunks
+  retrieved by semantic similarity from the indexed source.
+
+  Rules:
+  1. Answer ONLY from the chunks. If the chunks don't contain the answer, say
+     so explicitly and name what's missing.
+  2. Cite chunks inline using [chunk N] where N is the chunk's index in the
+     list below. Multiple citations: [chunk 2, chunk 5].
+  3. When you quote code, keep it to short snippets (1-3 lines) inside backticks.
+  4. Be concise — a paragraph or two, plus a short bullet list of evidence.
+  5. If the chunks contradict each other, surface that.
+
+# Replaces _EXT_PATTERNS in scripts/rag_query.py:224-235 when policy is loaded.
+# Each entry: ext is the canonical extension stored in file_path; patterns is
+# a list of regex strings tested against the user's natural-language query
+# (case-insensitive). Three case variants for .lsp because the chunker stores
+# the case verbatim from disk.
+ext_patterns:
+  - ext: ".vbs"
+    patterns: ['\.vbs\b', '\bvbscript\b', '\bvbs\s+(?:file|script|code)']
+  - ext: ".cs"
+    patterns: ['\.cs\b', '\bc#', '\bcsharp\b', '\bcs\s+(?:file|code)']
+  - ext: ".lsp"
+    patterns: ['\.lsp\b', '\blsp\b', '\blisp\b', '\bautolisp\b', '\bvlx\b']
+  - ext: ".Lsp"
+    patterns: ['\.lsp\b', '\blsp\b', '\blisp\b', '\bautolisp\b', '\bvlx\b']
+  - ext: ".LSP"
+    patterns: ['\.lsp\b', '\blsp\b', '\blisp\b', '\bautolisp\b', '\bvlx\b']
+  - ext: ".Cmd"
+    patterns: ['\.cmd\b', '\bbatch\s+(?:file|script)', '\bcmd\s+(?:file|script)']
+  - ext: ".sln"
+    patterns: ['\.sln\b', '\bsolution\s+file']
+  - ext: ".js"
+    patterns: ['\.js\b', '\bjavascript\b']
+  - ext: ".ini"
+    patterns: ['\.ini\b']
+  - ext: ".prv"
+    patterns: ['\.prv\b']
+
+# Replaces _PATH_STOP in scripts/rag_query.py:238 when policy is loaded.
+# Path segments too generic to be useful as path constraints.
+path_stop:
+  - "Original files"
+  - "Adds"
+  - "Common"
+  - "Lisp"
+  - "User"
+  - "Forms"
+  - "Archive"
+  - "Utils"
+  - "Menu"
+  - "Template"
+  - "Support"
+
+# Codebase-specific extensions to ADD to discovery.py:IGNORED_EXTENSIONS.
+# (Engine baseline already covers .arx, .vlx, .cuix, .shx, .slb, .stb, .lut,
+# .mnr, .dwg, .dxf, .dwt, .dst — kept there because they're broadly AutoCAD-
+# shaped. Add codebase-unique ones here.)
+extra_ignored_extensions: []
+
+# Optional text appended to core/synthesis.py:_SYSTEM_PROMPT.
+synthesis_overlay: |
+  Domain context: ADDS is a panel-management plugin for utility-distribution
+  drafting (electrical distribution panels). The forced minimum for shipping
+  is .NET 8 / AutoCAD 2025 / Oracle 19c with no functional regressions.
+  Prefer recommendations that preserve LISP and embedded-script behavior
+  unchanged where the host runtime allows it; the heavy lift is the C# layer.
+
+# Wiki generator overrides (consumed by scripts/generate_full_wiki.py).
+wiki:
+  title: "ADDS Modernization Wiki"
+  commit_message_format: "ADDS modernization #{rank}: {summary}"
+
+# Build verification (Phase 5b / P1 #5 — placeholder).
+# When the build-verification phase lands, the runner will shell out to:
+#   cd <build.cwd>; <build.cmd>
+# for each implementation diff. Failed builds mark the recommendation 'revise'.
+# Left empty for now — ADDS cannot build in a Linux Codespace anyway.
+build:
+  cmd: ""
+  cwd: ""
