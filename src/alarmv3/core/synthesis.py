@@ -63,9 +63,17 @@ Example format:
 class Synthesizer:
     """Generates recommendations by querying analysis.db and calling Claude."""
 
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, *, synthesis_overlay: "str | None" = None):
+        """Args:
+            session: ALARMv3 session.
+            synthesis_overlay: optional codebase-specific text appended to the
+                system prompt. Typically supplied from CodebasePolicy.
+                synthesis_overlay; injects domain framing without replacing
+                the generic recommendation contract.
+        """
         self._session = session
         self._db_path = session.artifact_dir / "analysis.db"
+        self._overlay = synthesis_overlay
 
     def run(self, aaa_grounding: "str | None" = None) -> dict:
         context = self._build_context()
@@ -157,12 +165,16 @@ class Synthesizer:
     def _call_claude(self, context: dict) -> list[dict]:
         client = anthropic.Anthropic()
 
+        prompt = _SYSTEM_PROMPT
+        if self._overlay:
+            prompt = f"{prompt}\n\n## Codebase context\n\n{self._overlay}"
+
         message = client.messages.create(
             model=_MODEL,
             max_tokens=_MAX_TOKENS,
             system=[{
                 "type": "text",
-                "text": _SYSTEM_PROMPT,
+                "text": prompt,
                 "cache_control": {"type": "ephemeral"},
             }],
             messages=[{

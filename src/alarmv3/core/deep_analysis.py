@@ -334,10 +334,26 @@ class SubsystemPartitioner:
 class DeepSynthesizer:
     """Runs the four-phase deep synthesis pipeline and stores results."""
 
-    def __init__(self, session: Session, progress_cb: Optional[Callable[[int, str], None]] = None):
+    def __init__(
+        self,
+        session: Session,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        *,
+        deep_analysis_overlay: Optional[str] = None,
+    ):
+        """Args:
+            session: ALARMv3 session.
+            progress_cb: optional progress callback (pct, message).
+            deep_analysis_overlay: optional codebase-specific text appended to
+                the aggregation system prompt. Typically supplied from
+                CodebasePolicy.deep_analysis_overlay; injects domain framing
+                (e.g. "this is a billing system") so the aggregation phase
+                weights findings appropriately.
+        """
         self._session = session
         self._db_path = session.artifact_dir / "analysis.db"
         self._progress = progress_cb or (lambda pct, msg: None)
+        self._overlay = deep_analysis_overlay
 
     def run(
         self,
@@ -461,6 +477,8 @@ class DeepSynthesizer:
     def _call_aggregation(self, findings_payload: dict, memory_text: str) -> list[dict]:
         client = anthropic.Anthropic()
         system_text = _AGGREGATION_PROMPT
+        if self._overlay:
+            system_text = system_text + "\n\n## Codebase context\n\n" + self._overlay
         if memory_text:
             system_text = system_text + "\n\n" + memory_text
         content = f"## All findings ({len(findings_payload.get('findings', []))} items)\n\n{json.dumps(findings_payload, indent=2)}"

@@ -92,10 +92,21 @@ IGNORED_EXTENSIONS = frozenset({
 class FileScanner:
     """Discovers files in the source zone and populates the manifest."""
 
-    def __init__(self, source: Path, session: Session):
+    def __init__(self, source: Path, session: Session, *, extra_ignored_extensions=None):
+        """Args:
+            source: source root.
+            session: ALARMv3 session.
+            extra_ignored_extensions: optional iterable of extra extensions
+                (lowercase, dot-prefixed) to add to the engine's
+                IGNORED_EXTENSIONS for this scan. Typically supplied from a
+                CodebasePolicy overlay so per-codebase binary blobs (e.g.
+                .rpt, .dacpac for billing systems) can be filtered without
+                editing the engine baseline.
+        """
         self._source = source
         self._session = session
         self._db_path = session.artifact_dir / "analysis.db"
+        self._ignored = IGNORED_EXTENSIONS | frozenset(extra_ignored_extensions or ())
         init_analysis_db(self._db_path)
 
     def scan(self, pool: ThreadPoolExecutor, job_id: str) -> int:
@@ -121,8 +132,8 @@ class FileScanner:
             if any(part in EXCLUDE_DIRS for part in path.parts):
                 continue
             # Skip known-binary / non-source extensions before they reach the
-            # manifest or the language researcher
-            if path.suffix.lower() in IGNORED_EXTENSIONS:
+            # manifest or the language researcher (engine baseline + policy extras)
+            if path.suffix.lower() in self._ignored:
                 continue
             yield path
 
