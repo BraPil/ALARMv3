@@ -77,12 +77,19 @@ def poll_job(orch, job_id: str, label: str, timeout_s: int = 7200) -> dict:
 
 
 def auto_accept_all_recommendations(session) -> int:
+    """Auto-accept only recommendations the adversarial evaluator marked 'accept'.
+
+    Recommendations with evaluator_verdict in {'pending','revise','reject'} are
+    left untouched and require human review via the MCP tool. This is the safe
+    default for non-interactive runs; see post-mortem §11 for context.
+    """
     db_path = session.artifact_dir / "analysis.db"
     conn = sqlite3.connect(db_path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         "UPDATE recommendation SET review_status='accepted', approved=1 "
-        "WHERE session_id=?", (session.session_id,),
+        "WHERE session_id=? AND evaluator_verdict='accept'",
+        (session.session_id,),
     )
     n = conn.execute(
         "SELECT COUNT(*) FROM recommendation WHERE session_id=? AND approved=1",

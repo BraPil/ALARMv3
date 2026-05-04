@@ -15,8 +15,14 @@ from alarmv3.core.session import SessionManager
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _seed_session_at_pending_review(tmp_path) -> tuple:
-    """Return (session, mcp_module_workspace_mock) seeded at RECOMMENDATIONS_PENDING_REVIEW."""
+def _seed_session_at_pending_review(tmp_path, verdicts: dict[int, str] | None = None):
+    """Return a session seeded at RECOMMENDATIONS_PENDING_REVIEW with three recs.
+
+    Args:
+        verdicts: Optional rank → evaluator_verdict mapping (e.g. {1: "accept",
+            2: "revise", 3: "reject"}). Ranks not listed default to 'pending'
+            (the schema default).
+    """
     sm = SessionManager(tmp_path)
     session = sm.get_or_create()
     session.set_source(tmp_path / "src")
@@ -31,14 +37,16 @@ def _seed_session_at_pending_review(tmp_path) -> tuple:
     init_analysis_db(db)
     conn = sqlite3.connect(db)
     now = time.time()
+    verdicts = verdicts or {}
     for rank in (1, 2, 3):
         conn.execute(
             "INSERT INTO recommendation("
             "session_id, rank, category, severity, title, description, "
-            "affected_files, effort, rationale, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "affected_files, effort, rationale, created_at, evaluator_verdict) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (session.session_id, rank, "security", "high",
-             f"Rec {rank}", f"Description {rank}", "[]", "M", "rationale", now),
+             f"Rec {rank}", f"Description {rank}", "[]", "M", "rationale", now,
+             verdicts.get(rank, "pending")),
         )
     conn.commit()
     conn.close()
@@ -77,16 +85,19 @@ def test_review_requires_pending_review_state(tmp_path):
 # ── review_recommendations — accept/reject logic ──────────────────────────────
 
 def test_review_marks_accepted_recommendations(tmp_path):
-    session = _seed_session_at_pending_review(tmp_path)
+    """Accepts only flow when evaluator_verdict='accept'. Rejects flow regardless."""
+    session = _seed_session_at_pending_review(
+        tmp_path, verdicts={1: "accept", 2: "accept", 3: "accept"},
+    )
     db = session.artifact_dir / "analysis.db"
 
-    # Directly exercise the DB update logic (same as the tool does)
+    # Directly exercise the gated DB update logic the tool now uses
     conn = sqlite3.connect(db, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     for rank in [1, 2]:
         conn.execute(
             "UPDATE recommendation SET review_status='accepted', approved=1 "
-            "WHERE session_id=? AND rank=?",
+            "WHERE session_id=? AND rank=? AND evaluator_verdict='accept'",
             (session.session_id, rank),
         )
     for rank in [3]:
@@ -110,6 +121,82 @@ def test_review_marks_accepted_recommendations(tmp_path):
     conn.close()
     assert accepted == 2
     assert rejected == 1
+
+
+# ── evaluator_verdict gate (P0 #1 — see post-mortem §11) ─────────────────────
+
+
+def test_accept_sql_skips_pending_verdict(tmp_path):
+    """The gated SQL must not flip review_status when evaluator_verdict='pending'."""
+    session = _seed_session_at_pending_review(tmp_path)  # all default to 'pending'
+    db = session.artifact_dir / "analysis.db"
+
+    conn = sqlite3.connect(db, timeout=10)
+    cur = conn.execute(
+        "UPDATE recommendation SET review_status='accepted', approved=1 "
+        "WHERE session_id=? AND rank=1 AND evaluator_verdict='accept'",
+        (session.session_id,),
+    )
+    conn.commit()
+    assert cur.rowcount == 0  # nothing matched
+    status = conn.execute(
+        "SELECT review_status, approved FROM recommendation "
+        "WHERE session_id=? AND rank=1", (session.session_id,),
+    ).fetchone()
+    conn.close()
+    assert status == ("pending", 0)
+
+
+def test_accept_sql_skips_revise_verdict(tmp_path):
+    session = _seed_session_at_pending_review(
+        tmp_path, verdicts={1: "revise", 2: "accept", 3: "reject"},
+    )
+    db = session.artifact_dir / "analysis.db"
+    conn = sqlite3.connect(db, timeout=10)
+    for rank in (1, 2, 3):
+        conn.execute(
+            "UPDATE recommendation SET review_status='accepted', approved=1 "
+            "WHERE session_id=? AND rank=? AND evaluator_verdict='accept'",
+            (session.session_id, rank),
+        )
+    conn.commit()
+    accepted_ranks = {row[0] for row in conn.execute(
+        "SELECT rank FROM recommendation WHERE session_id=? AND review_status='accepted'",
+        (session.session_id,),
+    ).fetchall()}
+    conn.close()
+    # Only rank 2 had verdict='accept', so only rank 2 should be accepted.
+    assert accepted_ranks == {2}
+
+
+def test_demo_auto_accept_helper_respects_verdict(tmp_path):
+    """scripts/demo_full_run.auto_accept_all_recommendations() honors evaluator_verdict."""
+    import importlib.util
+    from pathlib import Path as _Path
+
+    session = _seed_session_at_pending_review(
+        tmp_path, verdicts={1: "accept", 2: "revise", 3: "accept"},
+    )
+
+    # Import the script as a module
+    repo_root = _Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "demo_full_run", repo_root / "scripts" / "demo_full_run.py",
+    )
+    demo_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(demo_mod)
+
+    n = demo_mod.auto_accept_all_recommendations(session)
+    assert n == 2  # ranks 1 and 3 only
+
+    db = session.artifact_dir / "analysis.db"
+    conn = sqlite3.connect(db)
+    accepted_ranks = {row[0] for row in conn.execute(
+        "SELECT rank FROM recommendation WHERE session_id=? AND review_status='accepted'",
+        (session.session_id,),
+    ).fetchall()}
+    conn.close()
+    assert accepted_ranks == {1, 3}
 
 
 def test_review_transitions_to_analysis_complete(tmp_path):

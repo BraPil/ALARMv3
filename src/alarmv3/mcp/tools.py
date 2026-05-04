@@ -359,13 +359,24 @@ def register_tools(mcp: FastMCP) -> None:
             db_path = session.artifact_dir / "analysis.db"
             conn = sqlite3.connect(db_path, timeout=10)
             conn.execute("PRAGMA journal_mode=WAL")
+            skipped_due_to_verdict: list[int] = []
             try:
                 for rank in accept_ids:
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE recommendation SET review_status='accepted', approved=1 "
-                        "WHERE session_id=? AND rank=?",
+                        "WHERE session_id=? AND rank=? AND evaluator_verdict='accept'",
                         (session_id, rank),
                     )
+                    if cur.rowcount == 0:
+                        # Disambiguate: rank may not exist, or verdict isn't 'accept'.
+                        # Only report verdict-skips; missing ranks are caller error.
+                        existing_verdict = conn.execute(
+                            "SELECT evaluator_verdict FROM recommendation "
+                            "WHERE session_id=? AND rank=?",
+                            (session_id, rank),
+                        ).fetchone()
+                        if existing_verdict is not None and existing_verdict[0] != "accept":
+                            skipped_due_to_verdict.append(rank)
                 for rank in reject_ids:
                     conn.execute(
                         "UPDATE recommendation SET review_status='rejected' "
@@ -383,17 +394,27 @@ def register_tools(mcp: FastMCP) -> None:
 
             session.transition_to(SessionState.ANALYSIS_COMPLETE)
 
+            applied_accepts = len(accept_ids) - len(skipped_due_to_verdict)
+            msg_lines = [
+                f"Review complete. {accepted_count} recommendations accepted."
+            ]
+            if skipped_due_to_verdict:
+                msg_lines.append(
+                    f"Skipped {len(skipped_due_to_verdict)} accept(s) — "
+                    f"evaluator_verdict not 'accept': ranks {skipped_due_to_verdict}. "
+                    "Override requires re-running the evaluator or editing the verdict."
+                )
+            msg_lines.append("Full results at recommendations://latest.")
+            msg_lines.append("Proceed to implementation planning when ready.")
+
             return {
                 "session_id": session_id,
                 "state": session.state.value,
-                "accepted": len(accept_ids),
+                "accepted": applied_accepts,
                 "rejected": len(reject_ids),
+                "skipped_due_to_verdict": skipped_due_to_verdict,
                 "total_accepted": accepted_count,
-                "message": (
-                    f"Review complete. {accepted_count} recommendations accepted. "
-                    "Full results at recommendations://latest. "
-                    "Proceed to implementation planning when ready."
-                ),
+                "message": " ".join(msg_lines),
             }
         except GuardrailViolation as e:
             g.log_error("review_recommendations", str(e))

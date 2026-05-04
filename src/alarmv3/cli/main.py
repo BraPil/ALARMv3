@@ -93,12 +93,14 @@ def analyze(source_path: str, workspace: str, workers: int):
             result = Orchestrator(session).synthesize_recommendations()
             session.transition_to(SessionState.RECOMMENDATIONS_PENDING_REVIEW)
             prog.update(task, description="Running adversarial evaluator...")
-            # CLI is non-interactive: auto-accept all recommendations
+            # CLI is non-interactive: auto-accept only evaluator-approved recommendations.
+            # 'pending'/'revise'/'reject' rows stay pending and require human review.
             import sqlite3 as _sqlite3
             _conn = _sqlite3.connect(session.artifact_dir / "analysis.db", timeout=10)
             _conn.execute("PRAGMA journal_mode=WAL")
             _conn.execute(
-                "UPDATE recommendation SET review_status='accepted', approved=1 WHERE session_id=?",
+                "UPDATE recommendation SET review_status='accepted', approved=1 "
+                "WHERE session_id=? AND evaluator_verdict='accept'",
                 (session.session_id,),
             )
             _conn.commit()
