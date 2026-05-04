@@ -40,10 +40,27 @@ import ollama
 import pysqlite3 as sqlite3_with_ext
 import sqlite_vec
 
+# Make the alarmv3 package importable when running this script directly
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from alarmv3.core.codebase_policy import CodebasePolicy  # noqa: E402
+
 OLLAMA_MODEL = "nomic-embed-text"
 DEFAULT_CLAUDE = "claude-sonnet-4-6"
 DEFAULT_RERANK = "claude-haiku-4-5-20251001"
 
+# Module-level policy holder. set_policy() swaps it; consumers read _active_policy
+# first and fall back to the engine defaults below. Empty policy = legacy behavior.
+_active_policy: CodebasePolicy = CodebasePolicy.empty()
+
+
+def set_policy(policy: CodebasePolicy) -> None:
+    """Activate a codebase policy for this script's runtime. Idempotent."""
+    global _active_policy
+    _active_policy = policy
+
+
+# Engine default RAG prompt. ADDS-coupled for backward compatibility — load
+# `policy/adds.yaml` (or any other codebase policy) via `--policy` to override.
 _RAG_PROMPT = """\
 You are an expert code-archaeology assistant for the ADDS legacy codebase
 (AutoCAD plugin: AutoLISP + C# + PowerShell + Oracle). The user has asked a
@@ -59,6 +76,10 @@ Rules:
 4. Be concise — a paragraph or two, plus a short bullet list of evidence.
 5. If the chunks contradict each other, surface that.
 """
+
+
+def _rag_prompt() -> str:
+    return _active_policy.rag_prompt or _RAG_PROMPT
 
 
 def _vec_conn(db_path: Path) -> sqlite3_with_ext.Connection:
@@ -245,9 +266,10 @@ def _path_segments(db_path: Path) -> set[str]:
     """Distinctive directory-segment strings from the index's file_paths.
 
     "Distinctive" = length >= 5 OR contains a digit (catches '19.0'). Generic
-    segments like 'Common', 'Adds' are excluded — they would false-match
-    almost any natural-language query.
+    segments (e.g. 'Common', 'Adds' for ADDS) are excluded via the active
+    codebase policy's path_stop, falling back to _PATH_STOP if no policy.
     """
+    stop = _active_policy.path_stop or _PATH_STOP
     conn = sqlite3.connect(str(db_path), timeout=10)
     try:
         rows = conn.execute("SELECT DISTINCT file_path FROM code_chunk").fetchall()
@@ -256,7 +278,7 @@ def _path_segments(db_path: Path) -> set[str]:
     segs: set[str] = set()
     for (fp,) in rows:
         for seg in fp.split("/"):
-            if not seg or seg in _PATH_STOP:
+            if not seg or seg in stop:
                 continue
             if len(seg) >= 5 or any(c.isdigit() for c in seg):
                 segs.add(seg)
@@ -272,8 +294,9 @@ def _extract_path_constraints(query: str, db_path: Path) -> list[str]:
     patterns: list[str] = []
     q_lower = query.lower()
 
+    ext_patterns = _active_policy.ext_patterns or _EXT_PATTERNS
     seen_exts: set[str] = set()
-    for ext, regexes in _EXT_PATTERNS:
+    for ext, regexes in ext_patterns:
         if ext.lower() in seen_exts:
             continue  # don't double-add (.lsp/.Lsp/.LSP are case variants)
         if any(re.search(rx, q_lower) for rx in regexes):
@@ -719,7 +742,7 @@ def answer(query: str, chunks: list[dict], model: str = DEFAULT_CLAUDE) -> str:
         model=model,
         max_tokens=1500,
         system=[{"type": "text",
-                 "text": _RAG_PROMPT.format(n=len(chunks)),
+                 "text": _rag_prompt().format(n=len(chunks)),
                  "cache_control": {"type": "ephemeral"}}],
         messages=[{
             "role": "user",
@@ -751,11 +774,21 @@ def main() -> int:
     parser.add_argument("--rerank-pool", type=int, default=20,
                         help="Candidates fed to the reranker before truncation to top-k")
     parser.add_argument("--model", default=DEFAULT_CLAUDE)
+    parser.add_argument("--policy", type=str, default=None,
+                        help="Path to a codebase policy YAML (overrides RAG prompt, "
+                             "ext patterns, and path stop-words). See policy/adds.yaml.")
     parser.add_argument("--raw", action="store_true",
                         help="Print only retrieval results, skip LLM")
     parser.add_argument("--json", action="store_true",
                         help="Emit a JSON envelope")
     args = parser.parse_args()
+
+    if args.policy:
+        try:
+            set_policy(CodebasePolicy.load(args.policy))
+        except (FileNotFoundError, ValueError) as e:
+            print(f"ERROR loading policy: {e}", file=sys.stderr)
+            return 2
 
     db_path = Path(args.db)
     if not db_path.exists():
